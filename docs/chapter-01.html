@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="description" content="系统设计：从一台服务器开始。跟随林默与老周，在八章故事中理解缓存、数据库、消息队列与分布式共识。连载中，第九章待续。"><title>只有一百个人的王国 · 系统设计</title><script>try{document.documentElement.dataset.theme=localStorage.getItem('reader-theme')||'white';document.documentElement.style.setProperty('--reading-size',Math.max(16,Math.min(26,Number(localStorage.getItem('reader-size'))||18))+'px')}catch(e){}</script><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="shelf-nav.css"><link rel="stylesheet" href="reader.css"><script src="app.js" defer></script></head>
+<body class="reading"><a class="skip" href="#main">跳到正文</a><header><a class="brand" href="index.html">系统设计<span>SYSTEM DESIGN</span></a><nav class="shelf-nav" aria-label="学习项目导航"><a class="shelf-home" href="/">← 学习书架</a><details class="shelf-switch"><summary>切换项目 ▾</summary><div class="shelf-menu"><a href="/pytorch-apprentice/">PyTorch：炼金术士的学徒</a><a href="/ai-era-reader/">AI 纪元</a><a href="/data-empire-reader/">数据帝国</a><a href="/rag-empire-reader/">RAG 帝国</a><a href="/system-design-reader/" aria-current="page">系统设计</a></div></details></nav><div class="controls"><button id="smaller" aria-label="缩小字号" type="button">A−</button><button id="larger" aria-label="增大字号" type="button">A＋</button><button id="theme" aria-label="切换阅读背景" type="button">纯白</button></div></header>
+<div class="reader-layout"><aside><a href="index.html">← 全书目录</a><p class="eyebrow">本章导航</p><div class="toc">
+<ul>
+<li><a href="#_1">一、第一个问题：到底什么叫“系统设计”？</a></li>
+<li><a href="#_2">二、第一场灾难：服务器扛不住了</a></li>
+<li><a href="#qps">QPS</a></li>
+<li><a href="#_3">三、最简单的解决方案：氪金</a></li>
+<li><a href="#_5">四、第二台服务器出现了</a></li>
+<li><a href="#_6">五、负载均衡器登场</a></li>
+<li><a href="#_7">六、这里藏着系统设计的第一条大规律</a></li>
+<li><a href="#_8">七、可是第三场灾难马上来了</a></li>
+<li><a href="#_9">第一章结束：你现在只需要记住一张图</a></li>
+</ul>
+</div>
+</aside><main id="main"><div class="chapter-heading"><p class="eyebrow">CHAPTER 01 / 08 · 连载中</p><h1>只有一百个人的王国</h1><p>容量估算 · 负载均衡 · 水平扩展</p></div><details class="mobile-toc"><summary>展开本章目录</summary><div class="toc">
+<ul>
+<li><a href="#_1">一、第一个问题：到底什么叫“系统设计”？</a></li>
+<li><a href="#_2">二、第一场灾难：服务器扛不住了</a></li>
+<li><a href="#qps">QPS</a></li>
+<li><a href="#_3">三、最简单的解决方案：氪金</a></li>
+<li><a href="#_5">四、第二台服务器出现了</a></li>
+<li><a href="#_6">五、负载均衡器登场</a></li>
+<li><a href="#_7">六、这里藏着系统设计的第一条大规律</a></li>
+<li><a href="#_8">七、可是第三场灾难马上来了</a></li>
+<li><a href="#_9">第一章结束：你现在只需要记住一张图</a></li>
+</ul>
+</div>
+</details><article><p>2026 年，程序员林默做了个网站。</p>
+<p>功能极其简单：</p>
+<p><strong>用户发一条动态，别人可以查看。</strong></p>
+<p>类似一个极简版微博。</p>
+<p>林默看了一眼需求：</p>
+<pre><code class="language-text">POST /posts
+GET /posts/{id}
+</code></pre>
+<p>“这还不简单？”</p>
+<p>于是他租了一台服务器。</p>
+<p>服务器里面同时跑着：</p>
+<pre><code class="language-text">Nginx
+  ↓
+Spring Boot
+  ↓
+MySQL
+</code></pre>
+<p>甚至一开始，Nginx 都没有。</p>
+<p>就是：</p>
+<pre><code class="language-text">用户
+ ↓
+Spring Boot
+ ↓
+MySQL
+</code></pre>
+<p>用户发动态：</p>
+<pre><code class="language-sql">INSERT INTO post(user_id, content)
+VALUES (10001, '今天天气不错');
+</code></pre>
+<p>用户查看动态：</p>
+<pre><code class="language-sql">SELECT *
+FROM post
+WHERE id = 123;
+</code></pre>
+<p>网站上线。</p>
+<p>第一天，12 个用户。</p>
+<p>第二天，37 个用户。</p>
+<p>一个星期以后，103 个用户。</p>
+<p>服务器 CPU：</p>
+<pre><code class="language-text">3%
+</code></pre>
+<p>MySQL：</p>
+<pre><code class="language-text">毫无压力
+</code></pre>
+<p>林默非常满意。</p>
+<p>他甚至产生了一种错觉：</p>
+<blockquote>
+<p>“系统设计不就是 CRUD 吗？”</p>
+</blockquote>
+<hr />
+<h2 id="_1">一、第一个问题：到底什么叫“系统设计”？</h2>
+<p>三个月后，公司来了个架构师老周。</p>
+<p>老周问：</p>
+<p>“如果明天有 <strong>100 万用户</strong>呢？”</p>
+<p>林默回答：</p>
+<p>“换一台更好的服务器。”</p>
+<p>“1000 万呢？”</p>
+<p>“再换。”</p>
+<p>“1 亿呢？”</p>
+<p>“……”</p>
+<p>老周笑了。</p>
+<p>然后在白板上写下一句话：</p>
+<blockquote>
+<p><strong>系统设计，本质上是在各种约束下，让系统继续工作。</strong></p>
+</blockquote>
+<p>你设计的从来不只是代码。</p>
+<p>而是整个系统：</p>
+<pre><code class="language-text">用户
+ │
+ ▼
+网络
+ │
+ ▼
+服务器
+ │
+ ├── CPU
+ ├── 内存
+ ├── 磁盘
+ │
+ ▼
+数据库
+ │
+ ▼
+其他服务
+</code></pre>
+<p>任何地方都有可能成为瓶颈。</p>
+<p>所以以后遇到系统设计题，第一件事情永远不是：</p>
+<blockquote>
+<p>“我要不要上 Redis？”</p>
+</blockquote>
+<p>而是：</p>
+<blockquote>
+<p><strong>“这个系统的压力到底在哪里？”</strong></p>
+</blockquote>
+<hr />
+<h2 id="_2">二、第一场灾难：服务器扛不住了</h2>
+<p>半年后。</p>
+<p>这个网站突然火了。</p>
+<p>某天晚上，一个明星注册了账号。</p>
+<p>他发了一条动态。</p>
+<p>瞬间，大量用户涌入。</p>
+<p>服务器监控：</p>
+<pre><code class="language-text">QPS: 100
+CPU: 15%
+
+QPS: 500
+CPU: 43%
+
+QPS: 1000
+CPU: 78%
+
+QPS: 1500
+CPU: 99%
+</code></pre>
+<p>然后——</p>
+<pre><code class="language-text">Connection timeout
+Connection timeout
+Connection timeout
+</code></pre>
+<p>网站挂了。</p>
+<p>林默冲进机房：</p>
+<p>“数据库炸了？”</p>
+<p>老周摇头。</p>
+<p>“不是。”</p>
+<p>“那是什么？”</p>
+<p>“Spring Boot 服务器自己扛不住了。”</p>
+<hr />
+<p>这时候你第一次遇到系统设计里的核心指标：</p>
+<h2 id="qps">QPS</h2>
+<p>QPS：</p>
+<p><strong>Queries Per Second</strong></p>
+<p>在本书的 Web 场景中，用它表示每秒请求数；数据库语境中的 QPS 则通常指每秒查询数。</p>
+<p>假设：</p>
+<pre><code class="language-text">100 万用户
+</code></pre>
+<p>每个用户每天请求：</p>
+<pre><code class="language-text">100 次
+</code></pre>
+<p>那么一天：</p>
+<pre><code class="language-text">1亿次请求
+</code></pre>
+<p>平均 QPS：</p>
+<pre><code class="language-text">100,000,000 / 86400
+≈ 1157
+</code></pre>
+<p>但现实流量不会平均。</p>
+<p>凌晨三点：</p>
+<pre><code class="language-text">200 QPS
+</code></pre>
+<p>晚上八点：</p>
+<pre><code class="language-text">8000 QPS
+</code></pre>
+<p>明星突然官宣：</p>
+<pre><code class="language-text">50000 QPS
+</code></pre>
+<p>所以系统设计不能只看：</p>
+<blockquote>
+<p>平均 QPS。</p>
+</blockquote>
+<p>还要看：</p>
+<blockquote>
+<p><strong>峰值 QPS。</strong></p>
+</blockquote>
+<p>这就是系统设计题为什么经常先让你“估算流量”。</p>
+<p>因为你连敌人有多少都不知道，就开始造城墙，没有意义。</p>
+<hr />
+<h2 id="_3">三、最简单的解决方案：氪金</h2>
+<p>林默说：</p>
+<p>“服务器性能不够，那我买台更好的。”</p>
+<p>原服务器：</p>
+<pre><code class="language-text">4 Core
+8 GB
+</code></pre>
+<p>换成：</p>
+<pre><code class="language-text">32 Core
+128 GB
+</code></pre>
+<p>网站重新恢复。</p>
+<p>这在系统设计里面叫：</p>
+<h3 id="vertical-scaling">Vertical Scaling</h3>
+<p>纵向扩展。</p>
+<p>也就是：</p>
+<blockquote>
+<p><strong>把机器变强。</strong></p>
+</blockquote>
+<p>比如：</p>
+<pre><code class="language-text">4核 → 16核
+16GB → 64GB
+普通SSD → NVMe
+</code></pre>
+<p>这个方案最大的优点就是：</p>
+<p><strong>简单。</strong></p>
+<p>代码甚至不用改。</p>
+<hr />
+<p>但老周问：</p>
+<p>“如果这台机器也满了呢？”</p>
+<p>林默：</p>
+<p>“买 128 核。”</p>
+<p>“再满呢？”</p>
+<p>“……”</p>
+<p>问题出现了。</p>
+<p>单台机器不可能无限增强。</p>
+<p>而且还有一个更恐怖的问题。</p>
+<p>老周走到服务器旁边。</p>
+<p>啪。</p>
+<p>拔掉电源。</p>
+<p>整个网站：</p>
+<pre><code class="language-text">DOWN
+</code></pre>
+<p>林默：</p>
+<p>“？？？”</p>
+<p>老周说：</p>
+<blockquote>
+<p>“你这个系统现在有一个致命问题。”</p>
+</blockquote>
+<h3 id="_4">单点故障</h3>
+<p>Single Point of Failure。</p>
+<p>你的整个网站依赖这一台服务器。</p>
+<p>它挂：</p>
+<pre><code class="language-text">整个系统挂
+</code></pre>
+<p>硬盘坏：</p>
+<pre><code class="language-text">整个系统挂
+</code></pre>
+<p>机房断电：</p>
+<pre><code class="language-text">整个系统挂
+</code></pre>
+<p>升级重启：</p>
+<pre><code class="language-text">整个系统挂
+</code></pre>
+<p>所以，真正的大型系统不会只想着：</p>
+<blockquote>
+<p><strong>把一台机器变得越来越强。</strong></p>
+</blockquote>
+<p>而会开始考虑：</p>
+<blockquote>
+<p><strong>能不能增加机器？</strong></p>
+</blockquote>
+<hr />
+<h2 id="_5">四、第二台服务器出现了</h2>
+<p>第二天。</p>
+<p>林默又买了一台服务器。</p>
+<p>现在：</p>
+<pre><code class="language-text">Server A
+Server B
+</code></pre>
+<p>两台服务器都部署：</p>
+<pre><code class="language-text">Spring Boot
+</code></pre>
+<p>林默非常满意。</p>
+<p>“现在有机会分担更多请求。”</p>
+<p>老周问：</p>
+<p>“用户请求发给谁？”</p>
+<p>林默沉默了。</p>
+<p>假设：</p>
+<pre><code class="language-text">www.example.com
+</code></pre>
+<p>用户访问这个域名。</p>
+<p>到底进入：</p>
+<pre><code class="language-text">Server A
+</code></pre>
+<p>还是：</p>
+<pre><code class="language-text">Server B
+</code></pre>
+<p>？</p>
+<p>于是，系统里出现了一个新的角色。</p>
+<hr />
+<h2 id="_6">五、负载均衡器登场</h2>
+<p>老周在两台服务器前面放了一台机器。</p>
+<figure class="architecture"><div class="diagram-frame" tabindex="0" role="region" aria-label="把请求分给多台应用服务器，可横向滚动"><img alt="把请求分给多台应用服务器" src="diagrams/load-balancing.svg" /></div><figcaption>把请求分给多台应用服务器<a href="diagrams/load-balancing.svg" target="_blank" rel="noopener">查看大图 ↗</a></figcaption></figure>
+<details class="original-diagram">
+<summary>查看文字版示意</summary>
+<pre><code class="language-text">             ┌→ Server A
+用户 → LB ───┤
+             └→ Server B
+</code></pre>
+</details>
+<p>LB：</p>
+<h3 id="load-balancer">Load Balancer</h3>
+<p>负载均衡器。</p>
+<p>它负责：</p>
+<blockquote>
+<p><strong>把请求分配给不同服务器。</strong></p>
+</blockquote>
+<p>比如：</p>
+<pre><code class="language-text">请求1 → A
+请求2 → B
+请求3 → A
+请求4 → B
+</code></pre>
+<p>最简单的算法：</p>
+<h3 id="round-robin">Round Robin</h3>
+<p>轮询。</p>
+<pre><code class="language-text">A → B → C → A → B → C
+</code></pre>
+<p>于是：</p>
+<pre><code class="language-text">原来：
+
+10000 QPS
+   ↓
+Server A
+
+现在：
+
+10000 QPS
+   ↓
+Load Balancer
+   ↓
+ ┌─────┴─────┐
+5000        5000
+ ↓             ↓
+A              B
+</code></pre>
+<p>压力被分散。实际吞吐提升还取决于数据库、网络、负载均衡器和请求分布，并不保证随机器数量线性增长。</p>
+<p>如果还不够？</p>
+<p>继续加：</p>
+<pre><code class="language-text">          Load Balancer
+               │
+      ┌────────┼────────┐
+      ▼        ▼        ▼
+   Server A Server B Server C
+</code></pre>
+<p>再不够：</p>
+<pre><code class="language-text">A B C D E F G H ...
+</code></pre>
+<p>这就叫：</p>
+<h3 id="horizontal-scaling">Horizontal Scaling</h3>
+<p>水平扩展。</p>
+<p>不是：</p>
+<blockquote>
+<p>把一台服务器变成超级赛亚人。</p>
+</blockquote>
+<p>而是：</p>
+<blockquote>
+<p><strong>增加服务器数量。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_7">六、这里藏着系统设计的第一条大规律</h2>
+<p>林默盯着架构图：</p>
+<pre><code class="language-text">                    ┌── App 1
+Client → LB ────────┼── App 2
+                    ├── App 3
+                    └── App 4
+</code></pre>
+<p>突然意识到一个问题。</p>
+<p>“所以以后服务器不够，我就一直加机器？”</p>
+<p>老周说：</p>
+<p>“如果你的服务可以水平扩展，是的。”</p>
+<p>这句话非常重要。</p>
+<p>因为后面的：</p>
+<pre><code class="language-text">负载均衡
+Redis Cluster
+MySQL 分库分表
+Kafka Partition
+Elasticsearch Shard
+对象存储
+CDN
+</code></pre>
+<p>背后其实反复在做同一件事：</p>
+<blockquote>
+<p><strong>一台机器扛不住，就想办法把工作拆给很多机器。</strong></p>
+</blockquote>
+<p>这几乎是整个分布式系统的起点。</p>
+<hr />
+<h2 id="_8">七、可是第三场灾难马上来了</h2>
+<p>林默觉得自己已经懂系统设计了。</p>
+<p>现在架构：</p>
+<pre><code class="language-text">                 ┌→ Server A
+用户 → Nginx ────┤
+                 └→ Server B
+                       │
+                       ▼
+                     MySQL
+</code></pre>
+<p>Server A 和 Server B 都可以处理登录。</p>
+<p>某天，一个用户登录。</p>
+<p>请求被负载均衡发给：</p>
+<pre><code class="language-text">Server A
+</code></pre>
+<p>Server A 创建 Session：</p>
+<pre><code class="language-text">sessionId = abc123
+
+abc123 → userId 9527
+</code></pre>
+<p>存在哪里？</p>
+<p>服务器 A 的内存。</p>
+<p>下一秒。</p>
+<p>用户请求：</p>
+<pre><code class="language-text">GET /profile
+</code></pre>
+<p>负载均衡：</p>
+<pre><code class="language-text">→ Server B
+</code></pre>
+<p>Server B 查自己的内存：</p>
+<pre><code class="language-text">abc123？
+</code></pre>
+<p>没有。</p>
+<p>于是返回：</p>
+<pre><code class="language-text">401 Unauthorized
+</code></pre>
+<p>用户：</p>
+<p>“我刚登录怎么又让我登录？？？”</p>
+<p>刷新一下。</p>
+<p>请求到了 A。</p>
+<p>登录了。</p>
+<p>再刷新。</p>
+<p>到了 B。</p>
+<p>又掉登录。</p>
+<p>于是出现了极其魔幻的现象：</p>
+<pre><code class="language-text">刷新一次：已登录
+刷新一次：未登录
+刷新一次：已登录
+刷新一次：未登录
+</code></pre>
+<p>林默看傻了。</p>
+<hr />
+<p>老周在白板写下：</p>
+<blockquote>
+<p><strong>当你从一台服务器变成多台服务器以后，很多原本理所当然的事情都会失效。</strong></p>
+</blockquote>
+<p>因为以前：</p>
+<pre><code class="language-text">服务器 = 世界
+</code></pre>
+<p>现在：</p>
+<pre><code class="language-text">服务器 A 的内存
+≠
+服务器 B 的内存
+</code></pre>
+<p>这就是分布式系统真正开始的地方。</p>
+<p>林默问：</p>
+<p>“那 Session 怎么办？”</p>
+<p>老周写出了三个方案：</p>
+<pre><code class="language-text">方案一：Sticky Session
+方案二：Session Replication
+方案三：共享 Session
+</code></pre>
+<p>然后，在第三个方案下面写了一个名字：</p>
+<pre><code class="language-text">Redis
+</code></pre>
+<p>林默愣了一下。</p>
+<p>“Redis？”</p>
+<p>老周点头。</p>
+<blockquote>
+<p>“从下一章开始，你会发现系统设计里几乎所有中间件的出现，都不是因为架构师喜欢炫技。”</p>
+<p><strong>而是系统先出了问题，然后才有人发明东西解决它。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_9">第一章结束：你现在只需要记住一张图</h2>
+<pre><code class="language-text">阶段 1：
+
+User
+ ↓
+App
+ ↓
+MySQL
+
+阶段 2：单机性能不足
+
+User
+ ↓
+更强的 App
+
+Vertical Scaling
+
+阶段 3：单机存在极限
+
+              ┌→ App
+User → LB ────┼→ App
+              └→ App
+
+Horizontal Scaling
+
+阶段 4：分布式问题出现
+
+App A memory ≠ App B memory
+
+        ↓
+
+状态共享问题
+</code></pre>
+<p>这实际上已经串起了几个面试高频概念：</p>
+<p><strong>QPS → 峰值流量 → 单点故障 → 垂直扩展 → 水平扩展 → 负载均衡 → 无状态服务 → 分布式状态问题。</strong></p>
+<p>下一章可以顺着这个事故继续：<strong>《消失的登录状态——Redis 为什么会出现在系统架构里》</strong>。</p>
+<p>之后这条故事线会自然把 <strong>Redis 缓存 → 缓存穿透/击穿/雪崩 → MySQL 主从 → 读写分离 → 分库分表 → MQ 削峰 → 限流/熔断/降级 → CDN → 一致性 → CAP → 分布式事务</strong> 一路串起来。</p></article><nav class="chapter-nav" aria-label="章节切换"><a href="index.html">← 全书目录</a><a href="chapter-02.html" rel="next">下一章 →</a></nav></main></div><footer>系统设计：从一台服务器开始<br><small>现有 8 章 · 连载中 · 第九章待续</small><p><a href="editorial.html">整理说明与技术参考</a> · <a href="https://github.com/wupzl/system-design-reader">项目源码 ↗</a></p></footer></body></html>

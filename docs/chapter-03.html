@@ -1,0 +1,761 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="description" content="系统设计：从一台服务器开始。跟随林默与老周，在八章故事中理解缓存、数据库、消息队列与分布式共识。连载中，第九章待续。"><title>数据库开始冒烟——MySQL 主从复制与读写分离 · 系统设计</title><script>try{document.documentElement.dataset.theme=localStorage.getItem('reader-theme')||'white';document.documentElement.style.setProperty('--reading-size',Math.max(16,Math.min(26,Number(localStorage.getItem('reader-size'))||18))+'px')}catch(e){}</script><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="shelf-nav.css"><link rel="stylesheet" href="reader.css"><script src="app.js" defer></script></head>
+<body class="reading"><a class="skip" href="#main">跳到正文</a><header><a class="brand" href="index.html">系统设计<span>SYSTEM DESIGN</span></a><nav class="shelf-nav" aria-label="学习项目导航"><a class="shelf-home" href="/">← 学习书架</a><details class="shelf-switch"><summary>切换项目 ▾</summary><div class="shelf-menu"><a href="/pytorch-apprentice/">PyTorch：炼金术士的学徒</a><a href="/ai-era-reader/">AI 纪元</a><a href="/data-empire-reader/">数据帝国</a><a href="/rag-empire-reader/">RAG 帝国</a><a href="/system-design-reader/" aria-current="page">系统设计</a></div></details></nav><div class="controls"><button id="smaller" aria-label="缩小字号" type="button">A−</button><button id="larger" aria-label="增大字号" type="button">A＋</button><button id="theme" aria-label="切换阅读背景" type="button">纯白</button></div></header>
+<div class="reader-layout"><aside><a href="index.html">← 全书目录</a><p class="eyebrow">本章导航</p><div class="toc">
+<ul>
+<li><a href="#_1">一、不是所有请求都能被缓存</a></li>
+<li><a href="#_2">二、系统开始出现“读多写少”</a></li>
+<li><a href="#mysql">三、第二台 MySQL 出现了</a></li>
+<li><a href="#_4">四、数据怎么从主库跑到从库？</a></li>
+<li><a href="#_5">五、那为什么不直接让两台数据库都能写？</a></li>
+<li><a href="#_6">六、读写分离正式出现</a></li>
+<li><a href="#_8">七、从库也可以水平扩展</a></li>
+<li><a href="#bug">八、但新的 Bug 马上出现</a></li>
+<li><a href="#_9">九、主从延迟</a></li>
+<li><a href="#_10">十、这意味着什么？</a></li>
+<li><a href="#_12">十一、所有数据都能接受最终一致吗？</a></li>
+<li><a href="#_13">十二、那“写完马上读”怎么办？</a></li>
+<li><a href="#_14">十三、另一种方案：关键查询直接读主库</a></li>
+<li><a href="#_15">十四、然后主库挂了</a></li>
+<li><a href="#_16">十五、主从切换</a></li>
+<li><a href="#_17">十六、但切主也不是那么简单</a></li>
+<li><a href="#_18">十七、同步复制和异步复制</a></li>
+<li><a href="#_21">十八、系统设计里最重要的思维开始出现了</a></li>
+<li><a href="#_25">十九、可是从库加再多，也解决不了一个问题</a></li>
+<li><a href="#_29">第三章结束</a></li>
+</ul>
+</div>
+</aside><main id="main"><div class="chapter-heading"><p class="eyebrow">CHAPTER 03 / 08 · 连载中</p><h1>数据库开始冒烟——MySQL 主从复制与读写分离</h1><p>日志复制 · 读写分离 · 故障转移</p></div><details class="mobile-toc"><summary>展开本章目录</summary><div class="toc">
+<ul>
+<li><a href="#_1">一、不是所有请求都能被缓存</a></li>
+<li><a href="#_2">二、系统开始出现“读多写少”</a></li>
+<li><a href="#mysql">三、第二台 MySQL 出现了</a></li>
+<li><a href="#_4">四、数据怎么从主库跑到从库？</a></li>
+<li><a href="#_5">五、那为什么不直接让两台数据库都能写？</a></li>
+<li><a href="#_6">六、读写分离正式出现</a></li>
+<li><a href="#_8">七、从库也可以水平扩展</a></li>
+<li><a href="#bug">八、但新的 Bug 马上出现</a></li>
+<li><a href="#_9">九、主从延迟</a></li>
+<li><a href="#_10">十、这意味着什么？</a></li>
+<li><a href="#_12">十一、所有数据都能接受最终一致吗？</a></li>
+<li><a href="#_13">十二、那“写完马上读”怎么办？</a></li>
+<li><a href="#_14">十三、另一种方案：关键查询直接读主库</a></li>
+<li><a href="#_15">十四、然后主库挂了</a></li>
+<li><a href="#_16">十五、主从切换</a></li>
+<li><a href="#_17">十六、但切主也不是那么简单</a></li>
+<li><a href="#_18">十七、同步复制和异步复制</a></li>
+<li><a href="#_21">十八、系统设计里最重要的思维开始出现了</a></li>
+<li><a href="#_25">十九、可是从库加再多，也解决不了一个问题</a></li>
+<li><a href="#_29">第三章结束</a></li>
+</ul>
+</div>
+</details><article><p>林默原本以为，Redis 上线之后，系统终于轻松了。</p>
+<p>现在架构是：</p>
+<pre><code class="language-text">                      ┌→ App A
+用户 → Load Balancer ─┼→ App B
+                      └→ App C
+                           │
+                           ▼
+                         Redis
+                           │
+                           ▼
+                         MySQL
+</code></pre>
+<p>大多数热点查询都被 Redis 挡住了。</p>
+<p>MySQL 压力确实下降了。</p>
+<p>林默看着监控：</p>
+<pre><code class="language-text">CPU：35%
+连接数：正常
+慢查询：很少
+</code></pre>
+<p>“这次总该稳了吧？”</p>
+<p>老周没说话。</p>
+<p>三天后。</p>
+<p>事故来了。</p>
+<hr />
+<h2 id="_1">一、不是所有请求都能被缓存</h2>
+<p>有些数据适合缓存。</p>
+<p>比如：</p>
+<pre><code class="language-text">用户昵称
+商品详情
+热门文章
+配置项
+</code></pre>
+<p>因为它们：</p>
+<pre><code class="language-text">读很多
+写很少
+</code></pre>
+<p>但有些数据不一样。</p>
+<p>比如订单。</p>
+<p>用户打开：</p>
+<pre><code class="language-text">我的订单
+</code></pre>
+<p>可能必须看到最新状态：</p>
+<pre><code class="language-text">待支付
+已支付
+已发货
+已签收
+</code></pre>
+<p>库存也是：</p>
+<pre><code class="language-text">100
+99
+98
+97
+</code></pre>
+<p>这种数据如果缓存几分钟，很可能出问题。</p>
+<p>所以大量请求最终还是要查 MySQL。</p>
+<hr />
+<h2 id="_2">二、系统开始出现“读多写少”</h2>
+<p>老周调出了数据库监控：</p>
+<pre><code class="language-text">SELECT QPS：18000
+
+INSERT/UPDATE QPS：1200
+</code></pre>
+<p>林默一看：</p>
+<p>“读请求比写请求多十几倍。”</p>
+<p>这其实非常常见。</p>
+<p>比如电商商品：</p>
+<pre><code class="language-text">1 次修改商品价格
+
+可能对应
+
+100000 次商品详情查看
+</code></pre>
+<p>社交网站：</p>
+<pre><code class="language-text">1 次发动态
+
+对应
+
+大量用户阅读
+</code></pre>
+<p>所以很多互联网系统都有一个明显特征：</p>
+<blockquote>
+<p><strong>读多，写少。</strong></p>
+</blockquote>
+<p>林默问：</p>
+<p>“那是不是可以把读请求分散出去？”</p>
+<p>老周：</p>
+<p>“对。”</p>
+<hr />
+<h2 id="mysql">三、第二台 MySQL 出现了</h2>
+<p>老周画：</p>
+<pre><code class="language-text">             写
+App ─────────────→ MySQL Master
+                     │
+                     │ 复制
+                     ▼
+                 MySQL Slave
+                     ↑
+                     │
+                    读
+</code></pre>
+<p>这就是：</p>
+<h3 id="_3">主从复制</h3>
+<p>Master-Slave Replication。</p>
+<p>后来也常叫：</p>
+<pre><code class="language-text">Primary
+Replica
+</code></pre>
+<p>主库负责：</p>
+<pre><code class="language-text">INSERT
+UPDATE
+DELETE
+</code></pre>
+<p>从库主要负责：</p>
+<pre><code class="language-text">SELECT
+</code></pre>
+<p>于是原本：</p>
+<pre><code class="language-text">18000 SELECT
+1200 WRITE
+
+全部打主库
+</code></pre>
+<p>现在变成：</p>
+<pre><code class="language-text">主库：
+1200 WRITE
+部分 SELECT
+
+从库：
+大量 SELECT
+</code></pre>
+<p>主库压力显著下降。</p>
+<hr />
+<h2 id="_4">四、数据怎么从主库跑到从库？</h2>
+<p>林默有点疑惑：</p>
+<p>“主库写完数据，从库怎么知道？”</p>
+<p>老周说：</p>
+<p>“靠日志。”</p>
+<p>MySQL 主库每次修改数据时，会记录：</p>
+<h3 id="binlog">binlog</h3>
+<p>Binary Log。</p>
+<p>比如：</p>
+<pre><code class="language-text">用户余额：
+100 → 80
+</code></pre>
+<p>主库不仅修改数据，还写 binlog。</p>
+<p>可以粗略理解为：</p>
+<pre><code class="language-text">UPDATE account
+SET balance = 80
+WHERE id = 9527;
+</code></pre>
+<p>然后从库获取这些日志，再重放。这里的 SQL 用来说明变化；binlog 可以采用语句、行或混合格式，行格式记录的是行变化，并不总是保存这条 SQL。</p>
+<p>于是：</p>
+<pre><code class="language-text">主库执行一次修改
+       ↓
+写 binlog
+       ↓
+从库读取
+       ↓
+从库执行同样变化
+</code></pre>
+<p>最终：</p>
+<pre><code class="language-text">Master
+balance = 80
+
+Slave
+balance = 80
+</code></pre>
+<p>所以主从复制的本质其实就是：</p>
+<blockquote>
+<p><strong>主库把“我发生了什么变化”告诉从库，从库照着再做一遍。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_5">五、那为什么不直接让两台数据库都能写？</h2>
+<p>林默想得很自然：</p>
+<p>“既然两台数据库都有完整数据，那两边都能写不是更快？”</p>
+<p>比如：</p>
+<pre><code class="language-text">App A → DB A
+App B → DB B
+</code></pre>
+<p>老周问：</p>
+<p>“如果两边同时修改同一条数据呢？”</p>
+<p>比如账户余额原来：</p>
+<pre><code class="language-text">100
+</code></pre>
+<p>请求一：</p>
+<pre><code class="language-text">DB A：扣 20
+</code></pre>
+<p>请求二：</p>
+<pre><code class="language-text">DB B：扣 30
+</code></pre>
+<p>同时发生。</p>
+<p>那最后应该是多少？</p>
+<pre><code class="language-text">50
+</code></pre>
+<p>但如果双方独立写：</p>
+<pre><code class="language-text">DB A：80
+DB B：70
+</code></pre>
+<p>然后互相同步。</p>
+<p>谁覆盖谁？</p>
+<p>冲突怎么解决？</p>
+<p>林默开始头疼。</p>
+<p>老周说：</p>
+<blockquote>
+<p>“写操作最难的地方，不是性能，而是一致性。”</p>
+</blockquote>
+<p>所以很多架构先选择：</p>
+<pre><code class="language-text">一个主库统一写
+多个从库负责读
+</code></pre>
+<p>把写冲突问题先规避掉。</p>
+<hr />
+<h2 id="_6">六、读写分离正式出现</h2>
+<p>随着流量继续增加，系统变成：</p>
+<figure class="architecture"><div class="diagram-frame" tabindex="0" role="region" aria-label="读写分离：路由与复制是两条路径，可横向滚动"><img alt="读写分离：路由与复制是两条路径" src="diagrams/read-write-routing.svg" /></div><figcaption>读写分离：路由与复制是两条路径<a href="diagrams/read-write-routing.svg" target="_blank" rel="noopener">查看大图 ↗</a></figcaption></figure>
+<details class="original-diagram">
+<summary>查看文字版示意</summary>
+<pre><code class="language-text">App → DB Router ── 写 / 必要的读 ─→ Primary
+                └─ 允许延迟的读 ─→ Replica
+Primary ── binlog 复制 / relay log 应用 ─→ Replica
+</code></pre>
+</details>
+<p>写请求：</p>
+<pre><code class="language-text">INSERT
+UPDATE
+DELETE
+</code></pre>
+<p>发给：</p>
+<pre><code class="language-text">Master
+</code></pre>
+<p>读请求：</p>
+<pre><code class="language-text">SELECT
+</code></pre>
+<p>发给：</p>
+<pre><code class="language-text">Slave
+</code></pre>
+<p>这就是：</p>
+<h3 id="_7">读写分离</h3>
+<p>Read-Write Splitting。</p>
+<hr />
+<h2 id="_8">七、从库也可以水平扩展</h2>
+<p>如果查询越来越多：</p>
+<pre><code class="language-text">Slave 1 扛不住
+</code></pre>
+<p>怎么办？</p>
+<p>加：</p>
+<pre><code class="language-text">Slave 2
+Slave 3
+Slave 4
+</code></pre>
+<p>变成：</p>
+<pre><code class="language-text">                 ┌→ Replica A
+Primary ─────────┼→ Replica B
+                 ├→ Replica C
+                 └→ Replica D
+</code></pre>
+<p>读请求：</p>
+<pre><code class="language-text">8000 QPS
+</code></pre>
+<p>可以平均：</p>
+<pre><code class="language-text">A：2000
+B：2000
+C：2000
+D：2000
+</code></pre>
+<p>你会发现又回到了第一章那个规律：</p>
+<blockquote>
+<p><strong>一台扛不住，就增加机器，把压力分散出去。</strong></p>
+</blockquote>
+<p>只不过这次扩展的不是 App。</p>
+<p>而是数据库读取能力。</p>
+<hr />
+<h2 id="bug">八、但新的 Bug 马上出现</h2>
+<p>某天，用户修改昵称。</p>
+<p>原来：</p>
+<pre><code class="language-text">小明
+</code></pre>
+<p>改成：</p>
+<pre><code class="language-text">林默天下第一
+</code></pre>
+<p>请求：</p>
+<pre><code class="language-text">UPDATE user
+SET name = '林默天下第一'
+WHERE id = 9527;
+</code></pre>
+<p>写到了主库。</p>
+<p>主库：</p>
+<pre><code class="language-text">name = 林默天下第一
+</code></pre>
+<p>然后前端立刻跳转个人主页。</p>
+<p>页面查询：</p>
+<pre><code class="language-text">SELECT name
+FROM user
+WHERE id = 9527;
+</code></pre>
+<p>这次读请求被发到从库。</p>
+<p>结果从库返回：</p>
+<pre><code class="language-text">小明
+</code></pre>
+<p>用户：</p>
+<p>“？？？”</p>
+<p>刷新一下。</p>
+<p>又变成：</p>
+<pre><code class="language-text">林默天下第一
+</code></pre>
+<hr />
+<h2 id="_9">九、主从延迟</h2>
+<p>林默急了：</p>
+<p>“从库不是复制主库的吗？”</p>
+<p>老周：</p>
+<p>“复制需要时间。”</p>
+<p>比如：</p>
+<pre><code class="language-text">10:00:00.000
+主库写成功
+
+10:00:00.020
+binlog 发送
+
+10:00:00.050
+从库开始应用
+
+10:00:00.080
+从库完成
+</code></pre>
+<p>这中间几十毫秒：</p>
+<pre><code class="language-text">主库：新数据
+从库：旧数据
+</code></pre>
+<p>这就是：</p>
+<h3 id="replication-lag">Replication Lag</h3>
+<p>主从复制延迟。</p>
+<p>如果系统压力大，可能不是几十毫秒。</p>
+<p>甚至：</p>
+<pre><code class="language-text">几百毫秒
+几秒
+几十秒
+</code></pre>
+<hr />
+<h2 id="_10">十、这意味着什么？</h2>
+<p>读写分离并不是免费午餐。</p>
+<p>你获得：</p>
+<pre><code class="language-text">更强的读能力
+</code></pre>
+<p>但付出的代价是：</p>
+<pre><code class="language-text">短时间的数据不一致
+</code></pre>
+<p>也就是说：</p>
+<pre><code class="language-text">写成功
+≠
+所有数据库节点立刻看到最新数据
+</code></pre>
+<p>这就是分布式系统里非常核心的一个词：</p>
+<h3 id="_11">最终一致性</h3>
+<p>Eventual Consistency。</p>
+<p>意思是：</p>
+<blockquote>
+<p><strong>短时间内可以不一致，但最终会一致。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_12">十一、所有数据都能接受最终一致吗？</h2>
+<p>老周问林默：</p>
+<p>“头像更新后，几百毫秒看到旧头像，能接受吗？”</p>
+<p>“能。”</p>
+<p>“点赞数差一点？”</p>
+<p>“很多时候也能。”</p>
+<p>“银行余额呢？”</p>
+<p>林默：</p>
+<p>“不能。”</p>
+<p>“库存扣减呢？”</p>
+<p>“不能随便旧。”</p>
+<p>于是林默终于意识到：</p>
+<blockquote>
+<p><strong>一致性不是越强越好，而是看业务。</strong></p>
+</blockquote>
+<p>不同数据要求不同。</p>
+<p>例如：</p>
+<pre><code class="language-text">昵称、头像
+→ 可以接受短暂延迟
+
+评论数、点赞数
+→ 通常可以最终一致
+
+订单状态
+→ 要更谨慎
+
+余额、支付
+→ 通常要求强一致或更强保证
+</code></pre>
+<hr />
+<h2 id="_13">十二、那“写完马上读”怎么办？</h2>
+<p>这个问题叫：</p>
+<h3 id="read-your-writes">Read Your Writes</h3>
+<p>读己之写。</p>
+<p>用户自己刚刚修改的数据，通常希望自己马上能看到。</p>
+<p>常见方案之一：</p>
+<pre><code class="language-text">刚写完之后的一段时间
+强制读主库
+</code></pre>
+<p>例如：</p>
+<pre><code class="language-text">用户修改昵称
+    ↓
+写 Primary
+    ↓
+接下来 1 秒内查询本人信息
+    ↓
+直接查 Primary
+</code></pre>
+<p>其他普通查询：</p>
+<pre><code class="language-text">查 Replica
+</code></pre>
+<p>这样既能：</p>
+<pre><code class="language-text">保证关键场景一致
+</code></pre>
+<p>又不会：</p>
+<pre><code class="language-text">所有读请求都压主库
+</code></pre>
+<hr />
+<h2 id="_14">十三、另一种方案：关键查询直接读主库</h2>
+<p>比如：</p>
+<pre><code class="language-text">支付后查询订单状态
+</code></pre>
+<p>这个场景很关键。</p>
+<p>可以直接：</p>
+<pre><code class="language-text">写主库
+↓
+读主库
+</code></pre>
+<p>而普通历史订单列表：</p>
+<pre><code class="language-text">读从库
+</code></pre>
+<p>这就是系统设计里常见的思想：</p>
+<blockquote>
+<p><strong>不要追求全局统一策略，而是针对不同业务做取舍。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_15">十四、然后主库挂了</h2>
+<p>某天凌晨。</p>
+<p>报警响了。</p>
+<pre><code class="language-text">Primary DOWN
+</code></pre>
+<p>林默瞬间坐起来。</p>
+<p>从库都还活着。</p>
+<p>但问题是：</p>
+<pre><code class="language-text">SELECT 还能做
+</code></pre>
+<p>可是：</p>
+<pre><code class="language-text">INSERT
+UPDATE
+DELETE
+</code></pre>
+<p>全部失败。</p>
+<p>用户：</p>
+<pre><code class="language-text">不能下单
+不能支付
+不能发帖
+</code></pre>
+<p>整个系统几乎瘫痪。</p>
+<p>林默问：</p>
+<p>“不是有从库吗？选一个顶上不行？”</p>
+<p>老周：</p>
+<p>“对，这就是下一步。”</p>
+<hr />
+<h2 id="_16">十五、主从切换</h2>
+<p>原本：</p>
+<pre><code class="language-text">Primary
+   │
+   ├→ Replica A
+   └→ Replica B
+</code></pre>
+<p>Primary 挂掉后：</p>
+<pre><code class="language-text">Replica A
+</code></pre>
+<p>被提升为：</p>
+<pre><code class="language-text">New Primary
+</code></pre>
+<p>然后：</p>
+<pre><code class="language-text">New Primary
+   │
+   └→ Replica B
+</code></pre>
+<p>这叫：</p>
+<h3 id="failover">Failover</h3>
+<p>故障转移。</p>
+<p>系统自动：</p>
+<pre><code class="language-text">发现主库挂了
+↓
+选择一个从库
+↓
+提升为新主库
+↓
+应用连接到新主库
+</code></pre>
+<p>这就是高可用设计的一部分。</p>
+<hr />
+<h2 id="_17">十六、但切主也不是那么简单</h2>
+<p>假设：</p>
+<pre><code class="language-text">主库刚写入订单 A
+</code></pre>
+<p>但这个 binlog 还没同步到 Replica A。</p>
+<p>突然主库断电。</p>
+<p>Replica A 被提升成主库。</p>
+<p>结果：</p>
+<pre><code class="language-text">订单 A
+</code></pre>
+<p>在新主库上不存在。</p>
+<p>林默：</p>
+<p>“数据丢了？”</p>
+<p>老周：</p>
+<p>“有可能。”</p>
+<p>这就是复制模式中的一个核心权衡。</p>
+<hr />
+<h2 id="_18">十七、同步复制和异步复制</h2>
+<p>最简单的是：</p>
+<h3 id="_19">异步复制</h3>
+<p>主库：</p>
+<pre><code class="language-text">数据写成功
+↓
+直接返回客户端成功
+↓
+之后慢慢同步从库
+</code></pre>
+<p>优点：</p>
+<pre><code class="language-text">快
+</code></pre>
+<p>缺点：</p>
+<pre><code class="language-text">主库突然挂
+可能丢少量数据
+</code></pre>
+<hr />
+<p>另一种思路：</p>
+<h3 id="_20">同步复制</h3>
+<p>主库：</p>
+<pre><code class="language-text">写数据
+↓
+等从库确认
+↓
+再返回成功
+</code></pre>
+<p>优点：</p>
+<pre><code class="language-text">数据更安全
+</code></pre>
+<p>缺点：</p>
+<pre><code class="language-text">写入更慢
+</code></pre>
+<p>因为每次写都需要等待网络和从库。</p>
+<p>MySQL 半同步复制等待至少指定数量的副本确认事件已写入并刷盘到 relay log，不要求副本已经执行事务。因此，半同步并不等于读副本没有延迟；等待超时后还可能退回异步复制。故障切换也需要独立的检测、选主、旧主隔离和流量切换机制。</p>
+<p>这些方案，本质都是在：</p>
+<pre><code class="language-text">性能
+和
+可靠性
+</code></pre>
+<p>之间找平衡。</p>
+<hr />
+<h2 id="_21">十八、系统设计里最重要的思维开始出现了</h2>
+<p>林默突然发现：</p>
+<p>每一种架构升级都不是纯赚。</p>
+<p>比如：</p>
+<h3 id="redis">加 Redis</h3>
+<p>获得：</p>
+<pre><code class="language-text">性能
+</code></pre>
+<p>付出：</p>
+<pre><code class="language-text">缓存一致性复杂度
+</code></pre>
+<h3 id="_22">加主从</h3>
+<p>获得：</p>
+<pre><code class="language-text">读性能
+高可用
+</code></pre>
+<p>付出：</p>
+<pre><code class="language-text">复制延迟
+一致性问题
+运维复杂度
+</code></pre>
+<h3 id="_23">异步复制</h3>
+<p>获得：</p>
+<pre><code class="language-text">低延迟
+</code></pre>
+<p>付出：</p>
+<pre><code class="language-text">故障时可能丢数据
+</code></pre>
+<h3 id="_24">同步复制</h3>
+<p>获得：</p>
+<pre><code class="language-text">更强可靠性
+</code></pre>
+<p>付出：</p>
+<pre><code class="language-text">更高延迟
+</code></pre>
+<p>老周说：</p>
+<blockquote>
+<p>“真正的系统设计不是找完美方案。”</p>
+<p>“因为完美方案通常不存在。”</p>
+<p><strong>而是在性能、成本、一致性、可用性、复杂度之间做取舍。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_25">十九、可是从库加再多，也解决不了一个问题</h2>
+<p>几年后。</p>
+<p>业务继续增长。</p>
+<p>系统现在有：</p>
+<pre><code class="language-text">1亿用户
+</code></pre>
+<p>用户表：</p>
+<pre><code class="language-text">100000000 行
+</code></pre>
+<p>订单表：</p>
+<pre><code class="language-text">20亿行
+</code></pre>
+<p>即使读请求可以：</p>
+<pre><code class="language-text">Replica 1
+Replica 2
+Replica 3
+...
+</code></pre>
+<p>但写请求依然必须：</p>
+<pre><code class="language-text">→ Primary
+</code></pre>
+<p>一天产生：</p>
+<pre><code class="language-text">5000万条订单数据
+</code></pre>
+<p>主库开始出现：</p>
+<pre><code class="language-text">磁盘越来越大
+索引越来越大
+备份越来越慢
+DDL 越来越危险
+写 QPS 越来越高
+</code></pre>
+<p>林默想：</p>
+<p>“那我继续加从库？”</p>
+<p>老周摇头。</p>
+<blockquote>
+<p>“从库只能扩展读。”</p>
+<p>“你的问题现在是——”</p>
+</blockquote>
+<p>他在白板写：</p>
+<h3 id="_26">单库本身太大了</h3>
+<p>以及：</p>
+<h3 id="_27">单主写入能力达到上限</h3>
+<p>这次已经不是：</p>
+<pre><code class="language-text">多复制几份
+</code></pre>
+<p>能解决的。</p>
+<p>需要把：</p>
+<pre><code class="language-text">一个数据库
+</code></pre>
+<p>真正拆成：</p>
+<pre><code class="language-text">多个数据库
+</code></pre>
+<p>林默看到这里，已经隐约猜到了那个以前面试最讨厌的问题。</p>
+<p>老周写下四个字：</p>
+<h3 id="_28">分库分表</h3>
+<hr />
+<h2 id="_29">第三章结束</h2>
+<p>现在系统已经进化成：</p>
+<pre><code class="language-text">                           ┌→ App 1
+用户 → Load Balancer ──────┼→ App 2
+                           └→ App 3
+                                │
+                          ┌─────┴─────┐
+                          │           │
+                        Redis      DB Router
+                                      │
+                          ┌───────────┴──────────┐
+                          ▼                      ▼
+                       Primary               Replicas
+                          │               ┌────┼────┐
+                          │               ▼    ▼    ▼
+                          └────────────→ R1    R2   R3
+</code></pre>
+<p>这一章真正需要记住的链条是：</p>
+<pre><code class="language-text">单库压力大
+↓
+发现读多写少
+↓
+主从复制
+↓
+读写分离
+↓
+读能力水平扩展
+↓
+主从延迟
+↓
+最终一致性
+↓
+关键请求读主库
+↓
+主库单点
+↓
+Failover
+↓
+同步/异步复制取舍
+↓
+最后发现写能力和数据量仍然有极限
+↓
+分库分表
+</code></pre>
+<p>以后面试官问：</p>
+<blockquote>
+<p>“为什么要做 MySQL 主从？”</p>
+</blockquote>
+<p>最好不要只回答：</p>
+<blockquote>
+<p>“为了读写分离。”</p>
+</blockquote>
+<p>完整逻辑应该是：</p>
+<blockquote>
+<p><strong>单库读压力过大时，可以通过主从复制增加多个只读副本，将大量查询请求分散到从库，从而提升读吞吐，同时从库也可以用于故障转移和提高可用性。但代价是存在复制延迟，所以系统需要根据业务的一致性要求决定哪些请求读主库、哪些可以读从库。</strong></p>
+</blockquote>
+<p>下一章就是系统设计里第一次真正进入“很像大厂架构”的部分：</p>
+<h3 id="20">下一章：一张订单表塞进了 20 亿行——分库分表与一致性哈希</h3>
+<p>会把 <strong>为什么分表、为什么分库、水平拆分、垂直拆分、按 userId 取模、扩容为什么会翻车、一致性哈希、全局 ID、跨库查询</strong> 全部通过同一个事故串起来。</p>
+<p>行，下一章。</p></article><nav class="chapter-nav" aria-label="章节切换"><a href="chapter-02.html" rel="prev">← 上一章</a><a href="chapter-04.html" rel="next">下一章 →</a></nav></main></div><footer>系统设计：从一台服务器开始<br><small>现有 8 章 · 连载中 · 第九章待续</small><p><a href="editorial.html">整理说明与技术参考</a> · <a href="https://github.com/wupzl/system-design-reader">项目源码 ↗</a></p></footer></body></html>

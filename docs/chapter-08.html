@@ -1,0 +1,1479 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="description" content="系统设计：从一台服务器开始。跟随林默与老周，在八章故事中理解缓存、数据库、消息队列与分布式共识。连载中，第九章待续。"><title>两个数据库都说自己是真的——CAP、一致性与分布式共识 · 系统设计</title><script>try{document.documentElement.dataset.theme=localStorage.getItem('reader-theme')||'white';document.documentElement.style.setProperty('--reading-size',Math.max(16,Math.min(26,Number(localStorage.getItem('reader-size'))||18))+'px')}catch(e){}</script><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="shelf-nav.css"><link rel="stylesheet" href="reader.css"><script src="app.js" defer></script></head>
+<body class="reading"><a class="skip" href="#main">跳到正文</a><header><a class="brand" href="index.html">系统设计<span>SYSTEM DESIGN</span></a><nav class="shelf-nav" aria-label="学习项目导航"><a class="shelf-home" href="/">← 学习书架</a><details class="shelf-switch"><summary>切换项目 ▾</summary><div class="shelf-menu"><a href="/pytorch-apprentice/">PyTorch：炼金术士的学徒</a><a href="/ai-era-reader/">AI 纪元</a><a href="/data-empire-reader/">数据帝国</a><a href="/rag-empire-reader/">RAG 帝国</a><a href="/system-design-reader/" aria-current="page">系统设计</a></div></details></nav><div class="controls"><button id="smaller" aria-label="缩小字号" type="button">A−</button><button id="larger" aria-label="增大字号" type="button">A＋</button><button id="theme" aria-label="切换阅读背景" type="button">纯白</button></div></header>
+<div class="reader-layout"><aside><a href="index.html">← 全书目录</a><p class="eyebrow">本章导航</p><div class="toc">
+<ul>
+<li><a href="#_1">一、什么叫网络分区？</a></li>
+<li><a href="#_2">二、分布式系统最烦人的地方：你无法区分“挂了”和“没回消息”</a></li>
+<li><a href="#_3">三、事故真正开始了</a></li>
+<li><a href="#_4">四、这就是一致性问题</a></li>
+<li><a href="#_5">五、最理想的情况：强一致性</a></li>
+<li><a href="#_6">六、线性一致性的直觉</a></li>
+<li><a href="#_7">七、但强一致性要付出代价</a></li>
+<li><a href="#_8">八、选择一：拒绝服务</a></li>
+<li><a href="#_9">九、选择二：继续服务</a></li>
+<li><a href="#cap">十、CAP 正式出现</a></li>
+<li><a href="#p">十一、先理解 P</a></li>
+<li><a href="#cap_1">十二、CAP 不是“平时三选二”</a></li>
+<li><a href="#cp">十三、CP 系统</a></li>
+<li><a href="#ap">十四、AP 系统</a></li>
+<li><a href="#cp-ap">十五、到底什么时候选 CP，什么时候选 AP？</a></li>
+<li><a href="#_12">十六、这就是系统设计中的关键思想</a></li>
+<li><a href="#_13">十七、那多个副本怎么决定谁是真的？</a></li>
+<li><a href="#_14">十八、为什么多数派有用？</a></li>
+<li><a href="#_15">十九、五个节点呢？</a></li>
+<li><a href="#_16">二十、但谁负责协调写入？</a></li>
+<li><a href="#_17">二十一、共识到底是什么？</a></li>
+<li><a href="#raft">二十二、Raft 登场</a></li>
+<li><a href="#leader">二十三、Leader 挂了怎么办？</a></li>
+<li><a href="#term">二十四、为什么需要 Term？</a></li>
+<li><a href="#_18">二十五、日志复制</a></li>
+<li><a href="#_19">二十六、为什么不是等所有节点？</a></li>
+<li><a href="#raft_1">二十七、Raft 和主从复制有什么区别？</a></li>
+<li><a href="#_20">二十八、脑裂</a></li>
+<li><a href="#_21">二十九、多数派为什么能防脑裂？</a></li>
+<li><a href="#_22">三十、那为什么偶数节点通常没那么划算？</a></li>
+<li><a href="#_23">三十一、分布式锁开始出问题了</a></li>
+<li><a href="#_24">三十二、为什么“拿到锁”不代表你永远有资格操作？</a></li>
+<li><a href="#fencing-token">三十三、Fencing Token</a></li>
+<li><a href="#_25">三十四、这比“锁”更接近问题本质</a></li>
+<li><a href="#_26">三十五、版本号与乐观锁</a></li>
+<li><a href="#cas">三十六、CAS</a></li>
+<li><a href="#_27">三十七、一致性不是只有“强”和“最终”两档</a></li>
+<li><a href="#_29">三十八、所以系统设计里的“一致性”要问清楚</a></li>
+<li><a href="#cap-acid-c-c">三十九、CAP 和数据库事务 ACID 的 C 不是同一个 C</a></li>
+<li><a href="#base">四十、BASE</a></li>
+<li><a href="#_30">四十一、一次完整的网络分区推演</a></li>
+<li><a href="#_31">四十二、林默终于理解“共识”的含义了</a></li>
+<li><a href="#raft_2">四十三、那为什么不能所有数据都放进 Raft？</a></li>
+<li><a href="#_32">四十四、系统设计真正开始进入“取舍”</a></li>
+<li><a href="#_33">四十五、这一章真正应该形成的直觉</a></li>
+<li><a href="#_34">第八章结束</a></li>
+<li><a href="#_35">待续：订单成功了，库存却没扣——分布式事务</a></li>
+</ul>
+</div>
+</aside><main id="main"><div class="chapter-heading"><p class="eyebrow">CHAPTER 08 / 08 · 连载中</p><h1>两个数据库都说自己是真的——CAP、一致性与分布式共识</h1><p>CAP · 多数派 · Raft · 栅栏令牌</p></div><details class="mobile-toc"><summary>展开本章目录</summary><div class="toc">
+<ul>
+<li><a href="#_1">一、什么叫网络分区？</a></li>
+<li><a href="#_2">二、分布式系统最烦人的地方：你无法区分“挂了”和“没回消息”</a></li>
+<li><a href="#_3">三、事故真正开始了</a></li>
+<li><a href="#_4">四、这就是一致性问题</a></li>
+<li><a href="#_5">五、最理想的情况：强一致性</a></li>
+<li><a href="#_6">六、线性一致性的直觉</a></li>
+<li><a href="#_7">七、但强一致性要付出代价</a></li>
+<li><a href="#_8">八、选择一：拒绝服务</a></li>
+<li><a href="#_9">九、选择二：继续服务</a></li>
+<li><a href="#cap">十、CAP 正式出现</a></li>
+<li><a href="#p">十一、先理解 P</a></li>
+<li><a href="#cap_1">十二、CAP 不是“平时三选二”</a></li>
+<li><a href="#cp">十三、CP 系统</a></li>
+<li><a href="#ap">十四、AP 系统</a></li>
+<li><a href="#cp-ap">十五、到底什么时候选 CP，什么时候选 AP？</a></li>
+<li><a href="#_12">十六、这就是系统设计中的关键思想</a></li>
+<li><a href="#_13">十七、那多个副本怎么决定谁是真的？</a></li>
+<li><a href="#_14">十八、为什么多数派有用？</a></li>
+<li><a href="#_15">十九、五个节点呢？</a></li>
+<li><a href="#_16">二十、但谁负责协调写入？</a></li>
+<li><a href="#_17">二十一、共识到底是什么？</a></li>
+<li><a href="#raft">二十二、Raft 登场</a></li>
+<li><a href="#leader">二十三、Leader 挂了怎么办？</a></li>
+<li><a href="#term">二十四、为什么需要 Term？</a></li>
+<li><a href="#_18">二十五、日志复制</a></li>
+<li><a href="#_19">二十六、为什么不是等所有节点？</a></li>
+<li><a href="#raft_1">二十七、Raft 和主从复制有什么区别？</a></li>
+<li><a href="#_20">二十八、脑裂</a></li>
+<li><a href="#_21">二十九、多数派为什么能防脑裂？</a></li>
+<li><a href="#_22">三十、那为什么偶数节点通常没那么划算？</a></li>
+<li><a href="#_23">三十一、分布式锁开始出问题了</a></li>
+<li><a href="#_24">三十二、为什么“拿到锁”不代表你永远有资格操作？</a></li>
+<li><a href="#fencing-token">三十三、Fencing Token</a></li>
+<li><a href="#_25">三十四、这比“锁”更接近问题本质</a></li>
+<li><a href="#_26">三十五、版本号与乐观锁</a></li>
+<li><a href="#cas">三十六、CAS</a></li>
+<li><a href="#_27">三十七、一致性不是只有“强”和“最终”两档</a></li>
+<li><a href="#_29">三十八、所以系统设计里的“一致性”要问清楚</a></li>
+<li><a href="#cap-acid-c-c">三十九、CAP 和数据库事务 ACID 的 C 不是同一个 C</a></li>
+<li><a href="#base">四十、BASE</a></li>
+<li><a href="#_30">四十一、一次完整的网络分区推演</a></li>
+<li><a href="#_31">四十二、林默终于理解“共识”的含义了</a></li>
+<li><a href="#raft_2">四十三、那为什么不能所有数据都放进 Raft？</a></li>
+<li><a href="#_32">四十四、系统设计真正开始进入“取舍”</a></li>
+<li><a href="#_33">四十五、这一章真正应该形成的直觉</a></li>
+<li><a href="#_34">第八章结束</a></li>
+<li><a href="#_35">待续：订单成功了，库存却没扣——分布式事务</a></li>
+</ul>
+</div>
+</details><article><p>凌晨两点。</p>
+<p>北京机房和上海机房之间的专线突然抖了一下。</p>
+<p>最开始没人注意。</p>
+<p>因为：</p>
+<pre><code class="language-text">北京 Region：正常
+上海 Region：正常
+</code></pre>
+<p>两边机器都活着。</p>
+<p>CPU 正常。</p>
+<p>数据库正常。</p>
+<p>应用正常。</p>
+<p>但是很快，报警出现：</p>
+<pre><code class="language-text">Beijing → Shanghai timeout
+Shanghai → Beijing timeout
+</code></pre>
+<p>林默盯着屏幕。</p>
+<p>“机器都没挂，为什么系统报警？”</p>
+<p>老周看了一眼。</p>
+<p>“因为这次不是机器坏了。”</p>
+<p>“是它们——”</p>
+<blockquote>
+<p><strong>彼此听不见了。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_1">一、什么叫网络分区？</h2>
+<p>原本：</p>
+<pre><code class="language-text">Beijing DB
+   │
+   │ 网络正常
+   │
+Shanghai DB
+</code></pre>
+<p>现在：</p>
+<pre><code class="language-text">Beijing DB
+
+   X
+
+Shanghai DB
+</code></pre>
+<p>两边机器其实都活着。</p>
+<p>只是网络断开。</p>
+<p>这叫：</p>
+<h3 id="network-partition">Network Partition</h3>
+<p>网络分区。</p>
+<p>也可以理解为：</p>
+<blockquote>
+<p>一个分布式系统被网络切成了两个彼此无法通信的岛。</p>
+</blockquote>
+<p>这件事情非常危险。</p>
+<p>因为两边都会想：</p>
+<pre><code class="language-text">“我还活着。”
+</code></pre>
+<p>而且它们不知道：</p>
+<pre><code class="language-text">“对方到底是挂了，
+还是只是网络断了？”
+</code></pre>
+<hr />
+<h2 id="_2">二、分布式系统最烦人的地方：你无法区分“挂了”和“没回消息”</h2>
+<p>林默说：</p>
+<p>“那我 ping 一下不就知道了？”</p>
+<p>老周摇头。</p>
+<p>假设：</p>
+<pre><code class="language-text">A → B
+</code></pre>
+<p>请求 1 秒没有回应。</p>
+<p>可能原因：</p>
+<pre><code class="language-text">B 挂了
+网络断了
+网络拥塞
+B 很忙
+GC Stop-The-World
+磁盘卡住
+线程池满了
+</code></pre>
+<p>A 看到的只有：</p>
+<pre><code class="language-text">timeout
+</code></pre>
+<p>它无法百分之百知道到底是哪一种。</p>
+<p>这就是分布式系统一个非常根本的问题：</p>
+<blockquote>
+<p><strong>没有回应，不等于对方已经死亡。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_3">三、事故真正开始了</h2>
+<p>公司的用户资料系统做了双 Region。</p>
+<p>北京：</p>
+<pre><code class="language-text">User DB A
+</code></pre>
+<p>上海：</p>
+<pre><code class="language-text">User DB B
+</code></pre>
+<p>正常时：</p>
+<pre><code class="language-text">A ↔ B
+</code></pre>
+<p>不断同步。</p>
+<p>网络分区之后：</p>
+<pre><code class="language-text">A    X    B
+</code></pre>
+<p>这时北京用户把昵称改成：</p>
+<pre><code class="language-text">Alpha
+</code></pre>
+<p>上海用户同时把昵称改成：</p>
+<pre><code class="language-text">Beta
+</code></pre>
+<p>北京数据库说：</p>
+<pre><code class="language-text">name = Alpha
+</code></pre>
+<p>上海数据库说：</p>
+<pre><code class="language-text">name = Beta
+</code></pre>
+<p>网络恢复之后，两边一见面：</p>
+<pre><code class="language-text">A：我是 Alpha
+B：我是 Beta
+</code></pre>
+<p>谁是真的？</p>
+<p>林默沉默了。</p>
+<hr />
+<h2 id="_4">四、这就是一致性问题</h2>
+<p>如果系统有一个副本：</p>
+<pre><code class="language-text">只有 A
+</code></pre>
+<p>那么世界很简单。</p>
+<p>数据就是：</p>
+<pre><code class="language-text">A 里面是什么
+就是什么
+</code></pre>
+<p>但一旦有多个副本：</p>
+<pre><code class="language-text">A
+B
+C
+</code></pre>
+<p>就必须回答：</p>
+<blockquote>
+<p><strong>多个副本看到的数据，应该保持到什么程度的一致？</strong></p>
+</blockquote>
+<p>这就是：</p>
+<h3 id="consistency">Consistency</h3>
+<p>一致性。</p>
+<hr />
+<h2 id="_5">五、最理想的情况：强一致性</h2>
+<p>林默说：</p>
+<p>“那就要求所有节点永远一样。”</p>
+<p>老周：</p>
+<p>“这就是强一致性的直觉。”</p>
+<p>比如用户把余额：</p>
+<pre><code class="language-text">1000
+</code></pre>
+<p>改成：</p>
+<pre><code class="language-text">900
+</code></pre>
+<p>如果写成功，</p>
+<p>之后任何节点读取，都必须看到：</p>
+<pre><code class="language-text">900
+</code></pre>
+<p>而不能有人看到：</p>
+<pre><code class="language-text">1000
+</code></pre>
+<p>这类保证可以粗略理解为：</p>
+<h3 id="strong-consistency">Strong Consistency</h3>
+<p>强一致性。</p>
+<p>更严格的分布式语义里，还会讨论：</p>
+<pre><code class="language-text">Linearizability
+</code></pre>
+<p>线性一致性。</p>
+<p>它要求系统表现得像：</p>
+<blockquote>
+<p>所有操作仿佛在一台机器上按某个全局顺序瞬间发生。</p>
+</blockquote>
+<hr />
+<h2 id="_6">六、线性一致性的直觉</h2>
+<p>假设：</p>
+<pre><code class="language-text">t1：A 写 x = 10
+t2：写操作返回成功
+t3：B 读 x
+</code></pre>
+<p>如果：</p>
+<pre><code class="language-text">t3 &gt; t2
+</code></pre>
+<p>那么 B 必须读到：</p>
+<pre><code class="language-text">10
+</code></pre>
+<p>不能读：</p>
+<pre><code class="language-text">旧值
+</code></pre>
+<p>因为对用户来说：</p>
+<pre><code class="language-text">“这个写操作已经成功结束了。”
+</code></pre>
+<p>之后的读取就应该看到它。</p>
+<p>这就是一种非常强的语义。</p>
+<hr />
+<h2 id="_7">七、但强一致性要付出代价</h2>
+<p>现在北京和上海之间网络断了。</p>
+<p>北京用户要写：</p>
+<pre><code class="language-text">x = 10
+</code></pre>
+<p>如果要求强一致，</p>
+<p>北京必须确认：</p>
+<pre><code class="language-text">上海也同步好了
+</code></pre>
+<p>才能告诉用户：</p>
+<pre><code class="language-text">写成功
+</code></pre>
+<p>可问题是：</p>
+<pre><code class="language-text">北京根本联系不上上海
+</code></pre>
+<p>怎么办？</p>
+<p>只有两个选择。</p>
+<hr />
+<h2 id="_8">八、选择一：拒绝服务</h2>
+<p>北京：</p>
+<pre><code class="language-text">“联系不上上海，
+我不能保证一致性。”
+</code></pre>
+<p>于是：</p>
+<pre><code class="language-text">写请求失败
+</code></pre>
+<p>甚至部分读请求也可能失败。</p>
+<p>系统保持：</p>
+<pre><code class="language-text">一致
+</code></pre>
+<p>但牺牲：</p>
+<pre><code class="language-text">可用性
+</code></pre>
+<hr />
+<h2 id="_9">九、选择二：继续服务</h2>
+<p>北京：</p>
+<pre><code class="language-text">“算了，上海联系不上，
+我先自己写。”
+</code></pre>
+<p>上海也这么想。</p>
+<p>于是：</p>
+<pre><code class="language-text">北京：x = 10
+上海：x = 20
+</code></pre>
+<p>两边用户都得到：</p>
+<pre><code class="language-text">成功
+</code></pre>
+<p>系统保持：</p>
+<pre><code class="language-text">可用
+</code></pre>
+<p>但：</p>
+<pre><code class="language-text">数据不一致
+</code></pre>
+<p>网络恢复之后还得解决冲突。</p>
+<hr />
+<h2 id="cap">十、CAP 正式出现</h2>
+<p>老周终于在白板写下：</p>
+<pre><code class="language-text">C
+A
+P
+</code></pre>
+<h3 id="cap-theorem">CAP Theorem</h3>
+<p>CAP 定理。</p>
+<p>分别是：</p>
+<pre><code class="language-text">C = Consistency
+A = Availability
+P = Partition Tolerance
+</code></pre>
+<hr />
+<h2 id="p">十一、先理解 P</h2>
+<p>P：</p>
+<h3 id="partition-tolerance">Partition Tolerance</h3>
+<p>分区容错性。</p>
+<p>意思是：</p>
+<blockquote>
+<p>即使节点之间的网络出现分区，系统仍然必须能够按照某种方式继续处理。</p>
+</blockquote>
+<p>在真正的分布式系统里：</p>
+<pre><code class="language-text">网络故障
+</code></pre>
+<p>是无法彻底消灭的。</p>
+<p>所以通常：</p>
+<blockquote>
+<p><strong>P 不是“要不要选”的问题。</strong></p>
+</blockquote>
+<p>而是：</p>
+<pre><code class="language-text">网络分区发生时，
+你在 C 和 A 之间怎么取舍？
+</code></pre>
+<p>这才是 CAP 真正想表达的东西。</p>
+<hr />
+<h2 id="cap_1">十二、CAP 不是“平时三选二”</h2>
+<p>这是非常常见的误解。</p>
+<p>很多人背：</p>
+<blockquote>
+<p>CAP 三者只能选两个。</p>
+</blockquote>
+<p>然后说：</p>
+<pre><code class="language-text">CA
+CP
+AP
+</code></pre>
+<p>但现实中更准确的理解是：</p>
+<blockquote>
+<p><strong>当网络分区发生时，你无法同时保证强一致性和可用性。</strong></p>
+</blockquote>
+<p>因为正常情况下没有 Partition：</p>
+<pre><code class="language-text">网络正常
+</code></pre>
+<p>你当然可能同时获得：</p>
+<pre><code class="language-text">一致性
++
+可用性
+</code></pre>
+<p>真正的矛盾发生在：</p>
+<pre><code class="language-text">P 出现时
+</code></pre>
+<hr />
+<h2 id="cp">十三、CP 系统</h2>
+<p>如果发生网络分区：</p>
+<pre><code class="language-text">A    X    B
+</code></pre>
+<p>系统选择：</p>
+<blockquote>
+<p><strong>宁愿拒绝一部分请求，也不能产生不一致数据。</strong></p>
+</blockquote>
+<p>这就是偏：</p>
+<h3 id="cp_1">CP</h3>
+<p>Consistency + Partition Tolerance。</p>
+<p>比如某个关键写操作：</p>
+<pre><code class="language-text">不能确认多数节点
+↓
+拒绝写入
+</code></pre>
+<p>优点：</p>
+<pre><code class="language-text">数据更可信
+</code></pre>
+<p>缺点：</p>
+<pre><code class="language-text">网络异常时可能不可用
+</code></pre>
+<hr />
+<h2 id="ap">十四、AP 系统</h2>
+<p>另一种思路：</p>
+<p>即使：</p>
+<pre><code class="language-text">A    X    B
+</code></pre>
+<p>两边也继续服务。</p>
+<p>北京可以写。</p>
+<p>上海也可以写。</p>
+<p>这就是偏：</p>
+<h3 id="ap_1">AP</h3>
+<p>Availability + Partition Tolerance。</p>
+<p>优点：</p>
+<pre><code class="language-text">系统尽量可用
+</code></pre>
+<p>缺点：</p>
+<pre><code class="language-text">短时间可能不一致
+</code></pre>
+<p>等网络恢复：</p>
+<pre><code class="language-text">再合并
+</code></pre>
+<p>最终达到：</p>
+<h3 id="eventual-consistency">Eventual Consistency</h3>
+<p>最终一致性。</p>
+<hr />
+<h2 id="cp-ap">十五、到底什么时候选 CP，什么时候选 AP？</h2>
+<p>林默问：</p>
+<p>“那哪个更好？”</p>
+<p>老周：</p>
+<p>“看业务。”</p>
+<p>例如：</p>
+<h3 id="_10">银行扣款</h3>
+<p>如果两个 Region 都认为余额：</p>
+<pre><code class="language-text">100
+</code></pre>
+<p>北京花：</p>
+<pre><code class="language-text">80
+</code></pre>
+<p>上海同时花：</p>
+<pre><code class="language-text">80
+</code></pre>
+<p>两个地方都成功：</p>
+<pre><code class="language-text">总共花 160
+</code></pre>
+<p>显然不行。</p>
+<p>这种场景通常更偏向：</p>
+<pre><code class="language-text">一致性优先
+</code></pre>
+<hr />
+<h3 id="_11">社交点赞数</h3>
+<p>北京：</p>
+<pre><code class="language-text">1001
+</code></pre>
+<p>上海：</p>
+<pre><code class="language-text">1003
+</code></pre>
+<p>几十毫秒或几秒不一致，</p>
+<p>很多时候问题不大。</p>
+<p>这种场景可以更偏：</p>
+<pre><code class="language-text">可用性
+</code></pre>
+<hr />
+<h2 id="_12">十六、这就是系统设计中的关键思想</h2>
+<p>不是：</p>
+<pre><code class="language-text">“我要强一致。”
+</code></pre>
+<p>或者：</p>
+<pre><code class="language-text">“我要最终一致。”
+</code></pre>
+<p>而是：</p>
+<blockquote>
+<p><strong>哪部分业务需要什么级别的一致性？</strong></p>
+</blockquote>
+<p>例如：</p>
+<pre><code class="language-text">余额
+库存扣减
+支付状态
+→ 一致性要求高
+</code></pre>
+<pre><code class="language-text">点赞数
+浏览量
+推荐结果
+在线人数
+→ 可以弱一些
+</code></pre>
+<p>不要对整个系统统一使用最强一致性。</p>
+<p>否则：</p>
+<pre><code class="language-text">协调成本与复杂度上升
+延迟可能增加
+分区期间的可用性可能下降
+</code></pre>
+<p>都需要重新权衡。</p>
+<hr />
+<h2 id="_13">十七、那多个副本怎么决定谁是真的？</h2>
+<p>林默回到最初的问题。</p>
+<p>如果三个节点：</p>
+<pre><code class="language-text">A
+B
+C
+</code></pre>
+<p>谁说了算？</p>
+<p>老周：</p>
+<p>“最常见的一个思路——多数派。”</p>
+<h3 id="quorum">Quorum</h3>
+<p>法定人数 / 多数派。</p>
+<p>比如三个节点：</p>
+<pre><code class="language-text">A
+B
+C
+</code></pre>
+<p>多数是多少？</p>
+<pre><code class="language-text">2
+</code></pre>
+<p>如果一个值被：</p>
+<pre><code class="language-text">2 个节点
+</code></pre>
+<p>按照同一协议和版本规则确认，</p>
+<p>才可能把它认定为已提交。不能只数相同值的副本数量，就推断已经获得一致性。</p>
+<hr />
+<h2 id="_14">十八、为什么多数派有用？</h2>
+<p>假设：</p>
+<pre><code class="language-text">A B
+</code></pre>
+<p>认为：</p>
+<pre><code class="language-text">x = 10
+</code></pre>
+<p>而：</p>
+<pre><code class="language-text">C
+</code></pre>
+<p>认为：</p>
+<pre><code class="language-text">x = 9
+</code></pre>
+<p>因为：</p>
+<pre><code class="language-text">A + B = 2
+</code></pre>
+<p>是多数。</p>
+<p>所以：</p>
+<pre><code class="language-text">x = 10
+</code></pre>
+<p>可以被认为是当前有效状态。</p>
+<p>更重要的是：</p>
+<p>两个多数派集合一定会有交集。</p>
+<p>三节点中：</p>
+<pre><code class="language-text">任意 2 个节点
+</code></pre>
+<p>形成多数派。</p>
+<p>两个多数派不可能完全不重叠。</p>
+<p>例如：</p>
+<pre><code class="language-text">{A,B}
+{B,C}
+</code></pre>
+<p>一定至少共享：</p>
+<pre><code class="language-text">B
+</code></pre>
+<p>这给一致性提供了基础。交集本身还不够，必须结合版本、投票限制、日志新旧比较和提交规则，才能排除冲突历史。</p>
+<hr />
+<h2 id="_15">十九、五个节点呢？</h2>
+<pre><code class="language-text">A B C D E
+</code></pre>
+<p>多数：</p>
+<pre><code class="language-text">3
+</code></pre>
+<p>只要：</p>
+<pre><code class="language-text">3 个节点
+</code></pre>
+<p>还能通信，</p>
+<p>系统就可以继续达成多数决策。</p>
+<p>所以五节点集群可以容忍：</p>
+<pre><code class="language-text">2 个节点失败
+</code></pre>
+<p>而仍然保留多数。</p>
+<p>一般来说：</p>
+<pre><code class="language-text">2f + 1 个节点
+</code></pre>
+<p>可以容忍：</p>
+<pre><code class="language-text">f 个故障
+</code></pre>
+<p>前提是它们只是故障/失联，不涉及拜占庭恶意行为。</p>
+<hr />
+<h2 id="_16">二十、但谁负责协调写入？</h2>
+<p>老周又画：</p>
+<pre><code class="language-text">A
+B
+C
+</code></pre>
+<p>如果三个节点都能随便接受写：</p>
+<pre><code class="language-text">A：x=1
+B：x=2
+C：x=3
+</code></pre>
+<p>冲突很多。</p>
+<p>一种经典办法：</p>
+<blockquote>
+<p><strong>选一个 Leader。</strong></p>
+</blockquote>
+<pre><code class="language-text">       Leader A
+       /      \
+      B        C
+   Follower Follower
+</code></pre>
+<p>所有写：</p>
+<pre><code class="language-text">Client
+ ↓
+Leader
+</code></pre>
+<p>Leader 再复制给 Followers。</p>
+<p>这和 MySQL 主从有点像。</p>
+<p>但这里会进一步解决：</p>
+<pre><code class="language-text">Leader 是谁？
+Leader 挂了怎么办？
+多个节点都觉得自己是 Leader 怎么办？
+日志顺序怎么统一？
+</code></pre>
+<p>这就进入：</p>
+<h3 id="consensus">Consensus</h3>
+<p>分布式共识。</p>
+<hr />
+<h2 id="_17">二十一、共识到底是什么？</h2>
+<p>一句话：</p>
+<blockquote>
+<p><strong>让多个互不完全可靠的节点，对某件事情达成一致。</strong></p>
+</blockquote>
+<p>例如：</p>
+<pre><code class="language-text">谁是 Leader？
+</code></pre>
+<p>或者：</p>
+<pre><code class="language-text">第 100 条日志到底是什么？
+</code></pre>
+<p>或者：</p>
+<pre><code class="language-text">x 最终应该等于多少？
+</code></pre>
+<p>这类问题都属于共识问题。</p>
+<hr />
+<h2 id="raft">二十二、Raft 登场</h2>
+<p>老周说：</p>
+<p>“先不碰证明，先理解 Raft 的直觉。”</p>
+<p>Raft 里节点主要有三个状态：</p>
+<pre><code class="language-text">Follower
+Candidate
+Leader
+</code></pre>
+<p>正常情况下：</p>
+<pre><code class="language-text">        Leader
+       /      \
+Follower    Follower
+</code></pre>
+<p>只有一个 Leader。</p>
+<p>Leader 定期发送：</p>
+<pre><code class="language-text">Heartbeat
+</code></pre>
+<p>告诉大家：</p>
+<pre><code class="language-text">“我还活着。”
+</code></pre>
+<hr />
+<h2 id="leader">二十三、Leader 挂了怎么办？</h2>
+<p>比如：</p>
+<pre><code class="language-text">Leader A
+</code></pre>
+<p>突然宕机。</p>
+<p>Followers：</p>
+<pre><code class="language-text">B
+C
+</code></pre>
+<p>一段时间没收到心跳。</p>
+<p>其中一个节点：</p>
+<pre><code class="language-text">B
+</code></pre>
+<p>开始想：</p>
+<blockquote>
+<p>“Leader 好像死了，我来竞选。”</p>
+</blockquote>
+<p>于是变成：</p>
+<h3 id="candidate">Candidate</h3>
+<p>然后：</p>
+<pre><code class="language-text">B → 请求投票
+</code></pre>
+<p>如果获得多数票：</p>
+<pre><code class="language-text">B 成为新 Leader
+</code></pre>
+<p>架构变成：</p>
+<pre><code class="language-text">        Leader B
+       /      \
+     A?        C
+</code></pre>
+<p>A 恢复后发现：</p>
+<pre><code class="language-text">“现在 Leader 已经是 B。”
+</code></pre>
+<p>自己退回 Follower。</p>
+<hr />
+<h2 id="term">二十四、为什么需要 Term？</h2>
+<p>如果只是简单选举，很容易混乱。</p>
+<p>Raft 把时间切成：</p>
+<h3 id="term_1">Term</h3>
+<p>任期。</p>
+<p>例如：</p>
+<pre><code class="language-text">Term 1：A 是 Leader
+Term 2：B 是 Leader
+Term 3：C 是 Leader
+</code></pre>
+<p>每次重新选举：</p>
+<pre><code class="language-text">Term + 1
+</code></pre>
+<p>这样节点就可以判断：</p>
+<pre><code class="language-text">“你的信息是旧任期的，
+不算。”
+</code></pre>
+<p>比如：</p>
+<pre><code class="language-text">A：我是 Term 5 Leader
+B：我是 Term 7 Leader
+</code></pre>
+<p>那么：</p>
+<pre><code class="language-text">A 的身份已经过期
+</code></pre>
+<p>这对解决旧 Leader 恢复后的混乱非常关键。</p>
+<hr />
+<h2 id="_18">二十五、日志复制</h2>
+<p>客户端发送：</p>
+<pre><code class="language-text">SET x = 10
+</code></pre>
+<p>不是 Leader 自己写完就算成功。</p>
+<p>典型流程可以粗略理解为：</p>
+<figure class="architecture"><div class="diagram-frame" tabindex="0" role="region" aria-label="多数派确认，让提交的历史保持一致，可横向滚动"><img alt="多数派确认，让提交的历史保持一致" src="diagrams/raft-majority.svg" /></div><figcaption>多数派确认，让提交的历史保持一致<a href="diagrams/raft-majority.svg" target="_blank" rel="noopener">查看大图 ↗</a></figcaption></figure>
+<details class="original-diagram">
+<summary>查看文字版示意</summary>
+<pre><code class="language-text">Client
+ ↓
+Leader
+ ↓
+写入本地日志
+ ↓
+复制给 Followers
+ ↓
+多数节点确认
+ ↓
+Commit
+ ↓
+返回成功
+</code></pre>
+</details>
+<p>比如：</p>
+<pre><code class="language-text">A Leader
+B Follower
+C Follower
+</code></pre>
+<p>A 收到：</p>
+<pre><code class="language-text">x = 10
+</code></pre>
+<p>A 自己有。</p>
+<p>B 也确认。</p>
+<p>此时：</p>
+<pre><code class="language-text">2/3
+</code></pre>
+<p>多数。</p>
+<p>对于当前任期的日志条目，在满足 Raft 提交规则后，就可以推进提交位置。旧任期日志不能仅靠副本计数直接提交，通常要通过提交当前任期条目来间接提交之前的日志；客户端成功响应还应等状态机应用该命令。</p>
+<p>哪怕 C 暂时慢一点，</p>
+<p>也不影响。</p>
+<hr />
+<h2 id="_19">二十六、为什么不是等所有节点？</h2>
+<p>如果要求：</p>
+<pre><code class="language-text">A
+B
+C
+</code></pre>
+<p>全部确认，</p>
+<p>那 C 只要卡住：</p>
+<pre><code class="language-text">整个系统都不能写
+</code></pre>
+<p>可用性太差。</p>
+<p>所以多数派是一个经典折中：</p>
+<pre><code class="language-text">不用等所有
+但也不能只有自己
+</code></pre>
+<p>在：</p>
+<pre><code class="language-text">一致性
+可用性
+故障容忍
+</code></pre>
+<p>之间找到平衡。</p>
+<hr />
+<h2 id="raft_1">二十七、Raft 和主从复制有什么区别？</h2>
+<p>林默问：</p>
+<p>“这和上一章的主从不是很像吗？”</p>
+<p>“表面很像。”</p>
+<p>区别在于传统异步主从可能主要关注：</p>
+<pre><code class="language-text">复制
+</code></pre>
+<p>而共识协议还需要严格解决：</p>
+<pre><code class="language-text">Leader 选举
+日志顺序
+提交规则
+节点故障
+网络分区
+旧 Leader 恢复
+</code></pre>
+<p>目标是：</p>
+<blockquote>
+<p><strong>保证多个节点对操作顺序达成一致。</strong></p>
+</blockquote>
+<p>所以：</p>
+<pre><code class="language-text">复制 ≠ 共识
+</code></pre>
+<p>复制只是：</p>
+<pre><code class="language-text">把数据拷过去
+</code></pre>
+<p>共识还需要决定：</p>
+<pre><code class="language-text">“哪个版本才是合法历史？”
+</code></pre>
+<hr />
+<h2 id="_20">二十八、脑裂</h2>
+<p>网络突然分成：</p>
+<pre><code class="language-text">A B
+</code></pre>
+<p>和：</p>
+<pre><code class="language-text">C
+</code></pre>
+<p>如果 C 觉得：</p>
+<pre><code class="language-text">“A 和 B 都死了，我当 Leader。”
+</code></pre>
+<p>而 A 也觉得：</p>
+<pre><code class="language-text">“C 死了，我继续当 Leader。”
+</code></pre>
+<p>那系统出现：</p>
+<pre><code class="language-text">Leader A
++
+Leader C
+</code></pre>
+<p>这叫：</p>
+<h3 id="split-brain">Split Brain</h3>
+<p>脑裂。</p>
+<p>两个节点都认为自己有资格写。</p>
+<p>于是：</p>
+<pre><code class="language-text">A 接受订单 1
+C 接受订单 2
+</code></pre>
+<p>网络恢复：</p>
+<pre><code class="language-text">两套历史冲突
+</code></pre>
+<p>非常危险。</p>
+<hr />
+<h2 id="_21">二十九、多数派为什么能防脑裂？</h2>
+<p>三节点：</p>
+<pre><code class="language-text">A B C
+</code></pre>
+<p>网络分成：</p>
+<pre><code class="language-text">A B
+</code></pre>
+<p>和：</p>
+<pre><code class="language-text">C
+</code></pre>
+<p>A+B：</p>
+<pre><code class="language-text">2 个
+</code></pre>
+<p>拥有多数。</p>
+<p>C：</p>
+<pre><code class="language-text">1 个
+</code></pre>
+<p>没有多数。</p>
+<p>所以：</p>
+<pre><code class="language-text">A/B 一侧可以选 Leader
+C 一侧不能成为合法 Leader
+</code></pre>
+<p>于是只有能够取得多数派确认的一侧可以继续提交新写入。隔离的旧 Leader 可能暂时仍自认为是 Leader，但无法提交；线性一致读也需要 ReadIndex 等确认机制或满足假设的租约机制，不能直接读任意旧副本。</p>
+<p>这就是 Quorum 的重要价值。</p>
+<hr />
+<h2 id="_22">三十、那为什么偶数节点通常没那么划算？</h2>
+<p>假设：</p>
+<pre><code class="language-text">4 个节点
+</code></pre>
+<p>多数：</p>
+<pre><code class="language-text">3
+</code></pre>
+<p>能容忍：</p>
+<pre><code class="language-text">1 个失败
+</code></pre>
+<p>而：</p>
+<pre><code class="language-text">3 个节点
+</code></pre>
+<p>多数：</p>
+<pre><code class="language-text">2
+</code></pre>
+<p>也能容忍：</p>
+<pre><code class="language-text">1 个失败
+</code></pre>
+<p>所以：</p>
+<pre><code class="language-text">4 台
+</code></pre>
+<p>相比：</p>
+<pre><code class="language-text">3 台
+</code></pre>
+<p>并没有多获得一份故障容忍能力。</p>
+<p>只是多了一台机器。</p>
+<p>因此很多共识集群常见：</p>
+<pre><code class="language-text">3
+5
+7
+</code></pre>
+<p>这类奇数节点。</p>
+<p>当然实际部署还要考虑性能和拓扑，不是“永远只能奇数”。</p>
+<hr />
+<h2 id="_23">三十一、分布式锁开始出问题了</h2>
+<p>林默突然想起之前 Redis 做的分布式锁。</p>
+<p>比如：</p>
+<pre><code class="language-text">SET lock:order123 ownerA NX EX 10
+</code></pre>
+<p>A 获取锁。</p>
+<p>然后开始处理订单。</p>
+<p>锁 TTL：</p>
+<pre><code class="language-text">10 秒
+</code></pre>
+<p>但某次 A 发生长时间 GC。</p>
+<p>暂停：</p>
+<pre><code class="language-text">15 秒
+</code></pre>
+<p>锁已经过期。</p>
+<p>B 来了。</p>
+<p>获取成功：</p>
+<pre><code class="language-text">lock → ownerB
+</code></pre>
+<p>B 开始处理。</p>
+<p>这时 A 从 GC 中恢复。</p>
+<p>A 还以为：</p>
+<pre><code class="language-text">“我拿着锁。”
+</code></pre>
+<p>于是：</p>
+<pre><code class="language-text">A 和 B
+</code></pre>
+<p>同时操作资源。</p>
+<p>分布式锁失效了。</p>
+<hr />
+<h2 id="_24">三十二、为什么“拿到锁”不代表你永远有资格操作？</h2>
+<p>因为分布式世界里：</p>
+<pre><code class="language-text">时间
+网络
+进程暂停
+</code></pre>
+<p>都会出问题。</p>
+<p>A 获取锁时：</p>
+<pre><code class="language-text">合法
+</code></pre>
+<p>10 秒后：</p>
+<pre><code class="language-text">锁已经过期
+</code></pre>
+<p>但 A 自己并不知道。</p>
+<p>所以真正危险的不是：</p>
+<pre><code class="language-text">两个人同时抢锁
+</code></pre>
+<p>而是：</p>
+<blockquote>
+<p><strong>旧持有者恢复后继续执行。</strong></p>
+</blockquote>
+<p>这叫：</p>
+<h3 id="stale-owner">Stale Owner</h3>
+<p>过期持有者。</p>
+<hr />
+<h2 id="fencing-token">三十三、Fencing Token</h2>
+<p>老周给出一个更可靠的思路。</p>
+<p>每次获取锁，</p>
+<p>不仅得到：</p>
+<pre><code class="language-text">success
+</code></pre>
+<p>还得到一个递增编号：</p>
+<pre><code class="language-text">Token 101
+</code></pre>
+<p>下一次：</p>
+<pre><code class="language-text">Token 102
+</code></pre>
+<p>再下一次：</p>
+<pre><code class="language-text">103
+</code></pre>
+<p>假设：</p>
+<pre><code class="language-text">A → token 101
+</code></pre>
+<p>A 卡住。</p>
+<p>锁过期。</p>
+<p>B 获取：</p>
+<pre><code class="language-text">token 102
+</code></pre>
+<p>B 去写数据库或存储时：</p>
+<pre><code class="language-text">携带 token 102
+</code></pre>
+<p>底层记录：</p>
+<pre><code class="language-text">latest_token = 102
+</code></pre>
+<p>之后 A 恢复，</p>
+<p>携带：</p>
+<pre><code class="language-text">token 101
+</code></pre>
+<p>底层发现：</p>
+<pre><code class="language-text">101 &lt; 102
+</code></pre>
+<p>直接拒绝。</p>
+<p>这就是：</p>
+<h3 id="fencing-token_1">Fencing Token</h3>
+<p>栅栏令牌。</p>
+<blockquote>
+<p><strong>工程补充</strong>：令牌应由具有相应一致性保证的机制单调生成，受保护资源必须原子地校验令牌并完成写入。只携带一个数字、只做续租，或者只在应用侧检查，都不足以实现隔离；去重和重试规则也要单独设计。</p>
+</blockquote>
+<p>它不是阻止旧客户端醒来，</p>
+<p>而是：</p>
+<blockquote>
+<p><strong>即使旧客户端醒来，也不给它继续修改资源的资格。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_25">三十四、这比“锁”更接近问题本质</h2>
+<p>很多人讨论分布式锁时只关注：</p>
+<pre><code class="language-text">如何加锁
+如何续期
+如何释放
+</code></pre>
+<p>但更深一层的问题是：</p>
+<blockquote>
+<p><strong>如何确保过期持有者不能破坏最新状态？</strong></p>
+</blockquote>
+<p>所以在真正严格的一致性场景里，</p>
+<p>单纯：</p>
+<pre><code class="language-text">Redis NX + TTL
+</code></pre>
+<p>可能并不足够。</p>
+<p>还需要：</p>
+<pre><code class="language-text">版本号
+fencing token
+CAS
+共识存储
+</code></pre>
+<p>等更严格的机制。</p>
+<hr />
+<h2 id="_26">三十五、版本号与乐观锁</h2>
+<p>例如数据库里：</p>
+<pre><code class="language-text">balance = 100
+version = 5
+</code></pre>
+<p>A 读取：</p>
+<pre><code class="language-text">100, version 5
+</code></pre>
+<p>B 也读取：</p>
+<pre><code class="language-text">100, version 5
+</code></pre>
+<p>A 更新：</p>
+<pre><code class="language-sql">UPDATE account
+SET balance = 80,
+    version = 6
+WHERE id = 1
+  AND version = 5;
+</code></pre>
+<p>成功。</p>
+<p>B 再更新：</p>
+<pre><code class="language-sql">WHERE version = 5
+</code></pre>
+<p>此时数据库已经：</p>
+<pre><code class="language-text">version = 6
+</code></pre>
+<p>所以：</p>
+<pre><code class="language-text">更新 0 行
+</code></pre>
+<p>B 知道：</p>
+<pre><code class="language-text">“我的数据旧了。”
+</code></pre>
+<p>这就是：</p>
+<h3 id="optimistic-lock">Optimistic Lock</h3>
+<p>乐观锁。</p>
+<p>本质依然是：</p>
+<blockquote>
+<p><strong>不允许旧版本覆盖新版本。</strong></p>
+</blockquote>
+<hr />
+<h2 id="cas">三十六、CAS</h2>
+<p>这个思想可以抽象成：</p>
+<h3 id="compare-and-set">Compare And Set</h3>
+<p>比较并设置。</p>
+<p>意思是：</p>
+<pre><code class="language-text">只有当前值仍然是我预期的值
+我才更新
+</code></pre>
+<p>例如：</p>
+<pre><code class="language-text">if version == 5:
+    set version = 6
+</code></pre>
+<p>如果已经变成：</p>
+<pre><code class="language-text">6
+</code></pre>
+<p>说明别人先动了。</p>
+<p>那我不能直接覆盖。</p>
+<p>CAS 是很多并发控制机制的基础思想。</p>
+<hr />
+<h2 id="_27">三十七、一致性不是只有“强”和“最终”两档</h2>
+<p>老周继续写：</p>
+<pre><code class="language-text">Strong Consistency
+Eventual Consistency
+</code></pre>
+<p>中间其实还有很多语义。</p>
+<p>例如：</p>
+<h3 id="read-your-writes">Read Your Writes</h3>
+<p>自己刚写的数据，</p>
+<p>自己之后一定能看到。</p>
+<hr />
+<h3 id="monotonic-reads">Monotonic Reads</h3>
+<p>如果你已经看到：</p>
+<pre><code class="language-text">version 10
+</code></pre>
+<p>以后不能又看到：</p>
+<pre><code class="language-text">version 8
+</code></pre>
+<p>也就是：</p>
+<blockquote>
+<p>读取不能倒退。</p>
+</blockquote>
+<hr />
+<h3 id="monotonic-writes">Monotonic Writes</h3>
+<p>同一个客户端的写入：</p>
+<pre><code class="language-text">A
+↓
+B
+↓
+C
+</code></pre>
+<p>必须按顺序生效。</p>
+<p>不能：</p>
+<pre><code class="language-text">C 先于 B
+</code></pre>
+<hr />
+<h3 id="causal-consistency">Causal Consistency</h3>
+<p>如果事件 B 因为事件 A 才发生，</p>
+<p>其他人看到 B 时，</p>
+<p>也应该看到 A。</p>
+<p>比如：</p>
+<pre><code class="language-text">A：用户发帖
+B：别人回复这条帖子
+</code></pre>
+<p>如果你看到了回复 B，</p>
+<p>却看不到原帖 A，</p>
+<p>体验会很诡异。</p>
+<p>这就是：</p>
+<h3 id="_28">因果一致性</h3>
+<hr />
+<h2 id="_29">三十八、所以系统设计里的“一致性”要问清楚</h2>
+<p>面试官说：</p>
+<blockquote>
+<p>“这个系统要保证一致性。”</p>
+</blockquote>
+<p>不能就开始讲 CAP。</p>
+<p>应该先问：</p>
+<pre><code class="language-text">什么数据？
+什么操作？
+需要多强？
+允许多大延迟？
+网络分区时还能不能拒绝写？
+</code></pre>
+<p>因为：</p>
+<pre><code class="language-text">余额
+</code></pre>
+<p>和：</p>
+<pre><code class="language-text">点赞数
+</code></pre>
+<p>根本不是一回事。</p>
+<hr />
+<h2 id="cap-acid-c-c">三十九、CAP 和数据库事务 ACID 的 C 不是同一个 C</h2>
+<p>这也是一个高频误区。</p>
+<p>CAP：</p>
+<pre><code class="language-text">C = Consistency
+</code></pre>
+<p>这里讨论的是：</p>
+<blockquote>
+<p>多副本之间观察到的数据一致性。</p>
+</blockquote>
+<p>ACID：</p>
+<pre><code class="language-text">A = Atomicity
+C = Consistency
+I = Isolation
+D = Durability
+</code></pre>
+<p>ACID 的 Consistency 更偏：</p>
+<blockquote>
+<p>事务执行前后，数据库满足定义好的约束和合法状态。</p>
+</blockquote>
+<p>例如：</p>
+<pre><code class="language-text">余额不能违反业务约束
+外键必须满足
+</code></pre>
+<p>它们不是同一个概念。</p>
+<p>面试里混在一起会很危险。</p>
+<hr />
+<h2 id="base">四十、BASE</h2>
+<p>林默又看到一个词：</p>
+<h3 id="base_1">BASE</h3>
+<p>它通常和强事务系统形成对照。</p>
+<p>可以粗略记：</p>
+<pre><code class="language-text">Basically Available
+Soft State
+Eventual Consistency
+</code></pre>
+<p>核心思想：</p>
+<blockquote>
+<p>分布式系统有时为了可用性和扩展性，允许短暂不一致，最终再收敛。</p>
+</blockquote>
+<p>比如：</p>
+<pre><code class="language-text">点赞
+关注数
+消息统计
+推荐特征
+</code></pre>
+<p>就很常见。</p>
+<p>这不是说：</p>
+<pre><code class="language-text">BASE = 不管数据
+</code></pre>
+<p>而是：</p>
+<blockquote>
+<p><strong>一致性策略更灵活。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_30">四十一、一次完整的网络分区推演</h2>
+<p>老周说：</p>
+<p>“来，假设有三个节点。”</p>
+<pre><code class="language-text">A
+B
+C
+</code></pre>
+<p>A 是 Leader。</p>
+<p>正常：</p>
+<pre><code class="language-text">A ↔ B
+A ↔ C
+</code></pre>
+<p>突然网络分区：</p>
+<pre><code class="language-text">A
+
+X
+
+B ↔ C
+</code></pre>
+<p>A 单独一边。</p>
+<p>B+C 一边。</p>
+<p>林默：</p>
+<p>“A 还是原 Leader。”</p>
+<p>“对，但它只有 1 个节点。”</p>
+<p>新写请求来到 A。</p>
+<p>A 自己写成功。</p>
+<p>但无法获得：</p>
+<pre><code class="language-text">多数确认
+</code></pre>
+<p>所以：</p>
+<pre><code class="language-text">不能 Commit
+</code></pre>
+<p>不能告诉用户成功。</p>
+<hr />
+<p>另一边：</p>
+<pre><code class="language-text">B + C
+</code></pre>
+<p>一段时间收不到 A 心跳。</p>
+<p>开始选举。</p>
+<p>B 获得：</p>
+<pre><code class="language-text">B + C
+</code></pre>
+<p>多数票。</p>
+<p>于是：</p>
+<pre><code class="language-text">B 成为新 Leader
+</code></pre>
+<p>之后客户端写 B：</p>
+<pre><code class="language-text">B
+↓
+复制给 C
+↓
+2/3 多数
+↓
+提交
+</code></pre>
+<p>所以真正合法历史继续在：</p>
+<pre><code class="language-text">B+C
+</code></pre>
+<p>这一侧发展。</p>
+<p>网络恢复以后：</p>
+<pre><code class="language-text">A
+</code></pre>
+<p>发现自己任期已经旧了。</p>
+<p>退回 Follower。</p>
+<p>未提交的旧日志会被新 Leader 的合法日志覆盖/修正。</p>
+<p>这就是共识协议最迷人的地方：</p>
+<blockquote>
+<p><strong>不是保证所有节点永远不出错，而是保证系统最终只有一条被认可的历史。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_31">四十二、林默终于理解“共识”的含义了</h2>
+<p>共识不是：</p>
+<pre><code class="language-text">所有机器永远一样
+</code></pre>
+<p>而是：</p>
+<blockquote>
+<p>即使经历宕机、延迟、网络分区、重新选主，系统仍然能决定哪些操作是真正提交过的。</p>
+</blockquote>
+<p>这也是为什么：</p>
+<pre><code class="language-text">etcd
+ZooKeeper
+Consul
+</code></pre>
+<p>这类系统经常被用在：</p>
+<pre><code class="language-text">配置
+服务发现
+Leader Election
+分布式协调
+元数据
+</code></pre>
+<p>因为这些事情最怕：</p>
+<pre><code class="language-text">“大家各说各话。”
+</code></pre>
+<hr />
+<h2 id="raft_2">四十三、那为什么不能所有数据都放进 Raft？</h2>
+<p>林默：</p>
+<p>“既然 Raft 这么靠谱，那所有业务数据都强一致不就完了？”</p>
+<p>老周：</p>
+<p>“性能。”</p>
+<p>每个写请求可能需要：</p>
+<pre><code class="language-text">Leader
+↓
+网络复制
+↓
+多数确认
+↓
+Commit
+</code></pre>
+<p>如果节点跨 Region：</p>
+<pre><code class="language-text">北京
+新加坡
+美国
+</code></pre>
+<p>一次写延迟至少受制于：</p>
+<pre><code class="language-text">网络 RTT
+</code></pre>
+<p>你想要：</p>
+<pre><code class="language-text">全球强一致
++
+低延迟
++
+高可用
+</code></pre>
+<p>通常非常困难。</p>
+<p>所以现实系统经常：</p>
+<pre><code class="language-text">关键元数据
+→ 强一致
+
+大规模普通业务数据
+→ 分区 + 最终一致
+
+部分高价值数据
+→ 单 Region 强一致
+</code></pre>
+<p>分层处理。</p>
+<hr />
+<h2 id="_32">四十四、系统设计真正开始进入“取舍”</h2>
+<p>现在林默已经不再问：</p>
+<pre><code class="language-text">“哪个架构最好？”
+</code></pre>
+<p>而会问：</p>
+<pre><code class="language-text">这个业务最怕什么？
+</code></pre>
+<p>如果最怕：</p>
+<pre><code class="language-text">数据错
+</code></pre>
+<p>那就牺牲一些：</p>
+<pre><code class="language-text">可用性 / 延迟
+</code></pre>
+<p>如果最怕：</p>
+<pre><code class="language-text">服务不可用
+</code></pre>
+<p>那就允许：</p>
+<pre><code class="language-text">短暂不一致
+</code></pre>
+<p>如果两者都很重要：</p>
+<p>那就需要：</p>
+<pre><code class="language-text">更复杂架构
++
+更多资源
++
+更高成本
+</code></pre>
+<p>不存在免费午餐。</p>
+<hr />
+<h2 id="_33">四十五、这一章真正应该形成的直觉</h2>
+<p>老周最后在白板上写下：</p>
+<pre><code class="language-text">单机世界：
+只有一个真相
+</code></pre>
+<pre><code class="language-text">分布式世界：
+可能同时出现多个“真相”
+</code></pre>
+<p>所以你需要：</p>
+<pre><code class="language-text">Leader
+Quorum
+Version
+Consensus
+Conflict Resolution
+</code></pre>
+<p>来回答：</p>
+<blockquote>
+<p><strong>谁才是真的？</strong></p>
+</blockquote>
+<p>这就是分布式系统和普通 CRUD 最大的区别之一。</p>
+<hr />
+<h2 id="_34">第八章结束</h2>
+<p>这一章的完整因果链是：</p>
+<pre><code class="language-text">多副本
+↓
+网络分区
+↓
+多个节点可能看到不同数据
+↓
+一致性问题
+↓
+CAP
+↓
+网络分区下 C 与 A 的取舍
+↓
+CP / AP
+↓
+Quorum
+↓
+Leader
+↓
+共识
+↓
+Raft
+↓
+Term / Election / Log Replication
+↓
+脑裂
+↓
+多数派阻止双 Leader
+↓
+分布式锁仍可能出现旧持有者
+↓
+Fencing Token
+↓
+Version / CAS / 乐观锁
+↓
+不同业务选择不同一致性模型
+</code></pre>
+<p>如果面试官问：</p>
+<blockquote>
+<p><strong>“CAP 为什么不能三个都要？”</strong></p>
+</blockquote>
+<p>现在可以这样回答：</p>
+<blockquote>
+<p>当网络分区发生时，不同节点无法通信。如果仍要求所有请求都可用，那么不同分区只能独立处理请求，这可能造成数据不一致；如果要求强一致，则无法确认其他分区状态时必须拒绝部分请求，因此会牺牲可用性。所以在真实分布式系统中，分区容错通常不可避免，真正需要权衡的是分区期间的一致性和可用性。</p>
+</blockquote>
+<p>下一章继续顺着这个问题进入系统设计里另一个核心战场：</p>
+<h2 id="_35">待续：订单成功了，库存却没扣——分布式事务</h2>
+<p>会把 <strong>本地事务、ACID、2PC、XA、TCC、Saga、事务消息、Outbox、补偿事务、幂等、最终一致性</strong> 全部串进一次跨服务下单事故里。</p></article><nav class="chapter-nav" aria-label="章节切换"><a href="chapter-07.html" rel="prev">← 上一章</a><a href="index.html#coming">第九章待续 · 返回目录 →</a></nav></main></div><footer>系统设计：从一台服务器开始<br><small>现有 8 章 · 连载中 · 第九章待续</small><p><a href="editorial.html">整理说明与技术参考</a> · <a href="https://github.com/wupzl/system-design-reader">项目源码 ↗</a></p></footer></body></html>

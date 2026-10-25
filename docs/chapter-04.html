@@ -1,0 +1,1201 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="description" content="系统设计：从一台服务器开始。跟随林默与老周，在八章故事中理解缓存、数据库、消息队列与分布式共识。连载中，第九章待续。"><title>一张订单表塞进了 20 亿行——分库分表与一致性哈希 · 系统设计</title><script>try{document.documentElement.dataset.theme=localStorage.getItem('reader-theme')||'white';document.documentElement.style.setProperty('--reading-size',Math.max(16,Math.min(26,Number(localStorage.getItem('reader-size'))||18))+'px')}catch(e){}</script><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="shelf-nav.css"><link rel="stylesheet" href="reader.css"><script src="app.js" defer></script></head>
+<body class="reading"><a class="skip" href="#main">跳到正文</a><header><a class="brand" href="index.html">系统设计<span>SYSTEM DESIGN</span></a><nav class="shelf-nav" aria-label="学习项目导航"><a class="shelf-home" href="/">← 学习书架</a><details class="shelf-switch"><summary>切换项目 ▾</summary><div class="shelf-menu"><a href="/pytorch-apprentice/">PyTorch：炼金术士的学徒</a><a href="/ai-era-reader/">AI 纪元</a><a href="/data-empire-reader/">数据帝国</a><a href="/rag-empire-reader/">RAG 帝国</a><a href="/system-design-reader/" aria-current="page">系统设计</a></div></details></nav><div class="controls"><button id="smaller" aria-label="缩小字号" type="button">A−</button><button id="larger" aria-label="增大字号" type="button">A＋</button><button id="theme" aria-label="切换阅读背景" type="button">纯白</button></div></header>
+<div class="reader-layout"><aside><a href="index.html">← 全书目录</a><p class="eyebrow">本章导航</p><div class="toc">
+<ul>
+<li><a href="#20">一、20 亿行真正可怕的地方是什么？</a></li>
+<li><a href="#_1">二、老周提出了一个问题</a></li>
+<li><a href="#_2">三、分表：把一张大表切成很多小表</a></li>
+<li><a href="#_4">四、垂直拆分又是什么？</a></li>
+<li><a href="#_6">五、分表之后，问题只是缓解了一部分</a></li>
+<li><a href="#_7">六、分库出现了</a></li>
+<li><a href="#_9">七、最关键的问题来了：一条订单到底放哪？</a></li>
+<li><a href="#_10">八、最简单的规则：取模</a></li>
+<li><a href="#user_id">九、为什么经常用 user_id 做分片键？</a></li>
+<li><a href="#_11">十、但取模方案埋着一颗炸弹</a></li>
+<li><a href="#_13">十一、扩容为什么是分库分表最痛苦的阶段之一？</a></li>
+<li><a href="#_14">十二、一致性哈希登场</a></li>
+<li><a href="#_15">十三、把机器放到环上</a></li>
+<li><a href="#_16">十四、增加一台机器时发生什么？</a></li>
+<li><a href="#_17">十五、但是一致性哈希也不是万能药</a></li>
+<li><a href="#_18">十六、虚拟节点</a></li>
+<li><a href="#id">十七、另一个问题出现了：ID 冲突</a></li>
+<li><a href="#uuid">十八、最简单的方案：UUID</a></li>
+<li><a href="#snowflake">十九、Snowflake 出现了</a></li>
+<li><a href="#_22">二十、雪花算法又有坑</a></li>
+<li><a href="#_24">二十一、分库后最麻烦的事开始出现</a></li>
+<li><a href="#_25">二十二、分页也出事了</a></li>
+<li><a href="#join">二十三、JOIN 也开始崩</a></li>
+<li><a href="#_26">二十四、为什么说“分库分表能不做就不做”？</a></li>
+<li><a href="#_27">二十五、一个面试场景</a></li>
+<li><a href="#_28">二十六、冷热数据分离</a></li>
+<li><a href="#_29">二十七、林默重新整理了数据库扩展路线</a></li>
+<li><a href="#_30">二十八、但就在林默准备下班的时候……</a></li>
+<li><a href="#_31">第四章结束</a></li>
+</ul>
+</div>
+</aside><main id="main"><div class="chapter-heading"><p class="eyebrow">CHAPTER 04 / 08 · 连载中</p><h1>一张订单表塞进了 20 亿行——分库分表与一致性哈希</h1><p>数据分片 · 一致性哈希 · 全局 ID</p></div><details class="mobile-toc"><summary>展开本章目录</summary><div class="toc">
+<ul>
+<li><a href="#20">一、20 亿行真正可怕的地方是什么？</a></li>
+<li><a href="#_1">二、老周提出了一个问题</a></li>
+<li><a href="#_2">三、分表：把一张大表切成很多小表</a></li>
+<li><a href="#_4">四、垂直拆分又是什么？</a></li>
+<li><a href="#_6">五、分表之后，问题只是缓解了一部分</a></li>
+<li><a href="#_7">六、分库出现了</a></li>
+<li><a href="#_9">七、最关键的问题来了：一条订单到底放哪？</a></li>
+<li><a href="#_10">八、最简单的规则：取模</a></li>
+<li><a href="#user_id">九、为什么经常用 user_id 做分片键？</a></li>
+<li><a href="#_11">十、但取模方案埋着一颗炸弹</a></li>
+<li><a href="#_13">十一、扩容为什么是分库分表最痛苦的阶段之一？</a></li>
+<li><a href="#_14">十二、一致性哈希登场</a></li>
+<li><a href="#_15">十三、把机器放到环上</a></li>
+<li><a href="#_16">十四、增加一台机器时发生什么？</a></li>
+<li><a href="#_17">十五、但是一致性哈希也不是万能药</a></li>
+<li><a href="#_18">十六、虚拟节点</a></li>
+<li><a href="#id">十七、另一个问题出现了：ID 冲突</a></li>
+<li><a href="#uuid">十八、最简单的方案：UUID</a></li>
+<li><a href="#snowflake">十九、Snowflake 出现了</a></li>
+<li><a href="#_22">二十、雪花算法又有坑</a></li>
+<li><a href="#_24">二十一、分库后最麻烦的事开始出现</a></li>
+<li><a href="#_25">二十二、分页也出事了</a></li>
+<li><a href="#join">二十三、JOIN 也开始崩</a></li>
+<li><a href="#_26">二十四、为什么说“分库分表能不做就不做”？</a></li>
+<li><a href="#_27">二十五、一个面试场景</a></li>
+<li><a href="#_28">二十六、冷热数据分离</a></li>
+<li><a href="#_29">二十七、林默重新整理了数据库扩展路线</a></li>
+<li><a href="#_30">二十八、但就在林默准备下班的时候……</a></li>
+<li><a href="#_31">第四章结束</a></li>
+</ul>
+</div>
+</details><article><p>林默原本以为，给 MySQL 加了主从之后，数据库的问题已经解决得差不多了。</p>
+<p>现在系统是：</p>
+<pre><code class="language-text">                           ┌→ App 1
+用户 → Load Balancer ──────┼→ App 2
+                           └→ App 3
+                                │
+                          ┌─────┴─────┐
+                          │           │
+                        Redis      DB Router
+                                      │
+                             ┌────────┴────────┐
+                             ▼                 ▼
+                          Primary          Replicas
+</code></pre>
+<p>读请求可以分散。</p>
+<p>主库挂了也可以做 Failover。</p>
+<p>看起来很不错。</p>
+<p>直到有一天，DBA 发来一条消息：</p>
+<blockquote>
+<p>“订单表 20 亿行了。”</p>
+</blockquote>
+<p>林默第一反应：</p>
+<p>“20 亿行怎么了？MySQL 又不是不能存。”</p>
+<p>DBA 沉默了几秒。</p>
+<p>然后把监控发给他。</p>
+<pre><code class="language-text">orders 表：
+
+数据量：2.1 TB
+索引：780 GB
+单次备份：9 小时
+部分 SQL：3~8 秒
+新增索引：不敢动
+DDL：不敢动
+磁盘：快满了
+</code></pre>
+<p>林默：</p>
+<p>“……”</p>
+<p>老周看了一眼。</p>
+<p>“欢迎来到数据库的下一个阶段。”</p>
+<hr />
+<h2 id="20">一、20 亿行真正可怕的地方是什么？</h2>
+<p>很多人第一次听到：</p>
+<pre><code class="language-text">20 亿行
+</code></pre>
+<p>会觉得：</p>
+<blockquote>
+<p>“是不是因为 SELECT 会扫描 20 亿条？”</p>
+</blockquote>
+<p>其实如果索引设计得好：</p>
+<pre><code class="language-sql">SELECT *
+FROM orders
+WHERE id = 123456;
+</code></pre>
+<p>MySQL 并不会真的扫 20 亿行。</p>
+<p>B+ Tree 仍然可以快速定位。</p>
+<p>所以“大表问题”不是简单一句：</p>
+<blockquote>
+<p>数据多，所以查询慢。</p>
+</blockquote>
+<p>真正的问题是整个系统开始变得笨重。</p>
+<p>比如索引。</p>
+<p>假设：</p>
+<pre><code class="language-text">orders
+</code></pre>
+<p>上有：</p>
+<pre><code class="language-text">PRIMARY KEY(id)
+INDEX(user_id)
+INDEX(create_time)
+INDEX(status)
+</code></pre>
+<p>数据越来越多之后，每个索引也越来越大。</p>
+<p>可能已经大到：</p>
+<pre><code class="language-text">无法全部放进内存
+</code></pre>
+<p>于是查询开始频繁访问磁盘。</p>
+<p>缓存命中率下降。</p>
+<p>然后：</p>
+<pre><code class="language-text">随机 IO 增加
+↓
+查询延迟上升
+</code></pre>
+<hr />
+<p>再比如备份。</p>
+<p>以前：</p>
+<pre><code class="language-text">100 GB
+</code></pre>
+<p>备份一下没什么。</p>
+<p>后来：</p>
+<pre><code class="language-text">2 TB
+</code></pre>
+<p>全量备份变得非常慢。</p>
+<p>恢复更可怕。</p>
+<p>你可以备份 9 小时。</p>
+<p>但真出事故时，业务能等你恢复 9 小时吗？</p>
+<hr />
+<p>再比如 DDL。</p>
+<p>产品经理说：</p>
+<blockquote>
+<p>“订单表加一个字段。”</p>
+</blockquote>
+<p>以前：</p>
+<pre><code class="language-sql">ALTER TABLE orders ADD COLUMN source INT;
+</code></pre>
+<p>林默啪一下就执行了。</p>
+<p>现在看到：</p>
+<pre><code class="language-text">20 亿行
+</code></pre>
+<p>他手都不敢点 Enter。</p>
+<hr />
+<h2 id="_1">二、老周提出了一个问题</h2>
+<p>老周问：</p>
+<p>“这些 20 亿订单，需要放在同一台机器吗？”</p>
+<p>林默：</p>
+<p>“什么意思？”</p>
+<p>老周画了一张图：</p>
+<pre><code class="language-text">原来：
+
+orders
+
+20亿条
+</code></pre>
+<p>然后把它从中间切开：</p>
+<pre><code class="language-text">orders_0
+10亿条
+
+orders_1
+10亿条
+</code></pre>
+<p>林默眼睛一亮。</p>
+<blockquote>
+<p>“分表？”</p>
+</blockquote>
+<p>“对。”</p>
+<hr />
+<h2 id="_2">三、分表：把一张大表切成很多小表</h2>
+<p>比如原来：</p>
+<pre><code class="language-text">orders
+20 亿行
+</code></pre>
+<p>拆成：</p>
+<pre><code class="language-text">orders_0
+orders_1
+orders_2
+orders_3
+</code></pre>
+<p>每张：</p>
+<pre><code class="language-text">5 亿行
+</code></pre>
+<p>这就是：</p>
+<h3 id="_3">水平分表</h3>
+<p>Horizontal Partitioning。</p>
+<p>为什么叫“水平”？</p>
+<p>想象一张表：</p>
+<pre><code class="language-text">id | user_id | amount | status
+--------------------------------
+1
+2
+3
+4
+5
+6
+</code></pre>
+<p>横着切：</p>
+<pre><code class="language-text">表A：
+1
+2
+3
+
+表B：
+4
+5
+6
+</code></pre>
+<p>字段没变。</p>
+<p>只是：</p>
+<blockquote>
+<p><strong>把不同的行分开。</strong></p>
+</blockquote>
+<p>所以叫水平拆分。</p>
+<hr />
+<h2 id="_4">四、垂直拆分又是什么？</h2>
+<p>老周又画：</p>
+<pre><code class="language-text">user 表：
+
+id
+name
+phone
+email
+avatar
+address
+bio
+preferences
+last_login
+...
+</code></pre>
+<p>林默说：</p>
+<p>“字段好多。”</p>
+<p>“对。”</p>
+<p>如果一张表字段特别多，而且不同字段访问频率不同，也可以拆。</p>
+<p>例如：</p>
+<pre><code class="language-text">user_basic
+
+id
+name
+phone
+email
+</code></pre>
+<p>以及：</p>
+<pre><code class="language-text">user_profile
+
+user_id
+avatar
+address
+bio
+preferences
+</code></pre>
+<p>这叫：</p>
+<h3 id="_5">垂直分表</h3>
+<p>Vertical Partitioning。</p>
+<p>也就是：</p>
+<blockquote>
+<p><strong>按列拆。</strong></p>
+</blockquote>
+<p>记忆非常简单：</p>
+<pre><code class="language-text">水平拆分
+→ 拆行
+
+垂直拆分
+→ 拆列
+</code></pre>
+<hr />
+<h2 id="_6">五、分表之后，问题只是缓解了一部分</h2>
+<p>林默把订单拆成：</p>
+<pre><code class="language-text">orders_0
+orders_1
+orders_2
+orders_3
+</code></pre>
+<p>但四张表还在：</p>
+<pre><code class="language-text">同一个 MySQL 实例
+</code></pre>
+<p>也就是说：</p>
+<pre><code class="language-text">同一块 CPU
+同一块内存
+同一套磁盘 IO
+</code></pre>
+<p>单机写入能力还是有限。</p>
+<p>于是老周问：</p>
+<blockquote>
+<p>“既然表都可以拆，数据库为什么不能拆？”</p>
+</blockquote>
+<hr />
+<h2 id="_7">六、分库出现了</h2>
+<p>原来：</p>
+<pre><code class="language-text">MySQL A
+
+orders_0
+orders_1
+orders_2
+orders_3
+</code></pre>
+<p>现在：</p>
+<pre><code class="language-text">DB 0
+└── orders_0
+
+DB 1
+└── orders_1
+
+DB 2
+└── orders_2
+
+DB 3
+└── orders_3
+</code></pre>
+<p>请求真正被分散到不同机器。</p>
+<p>这叫：</p>
+<h3 id="_8">分库</h3>
+<p>Sharding。</p>
+<p>现在：</p>
+<pre><code class="language-text">写请求 20000 QPS
+</code></pre>
+<p>理论上可以变成：</p>
+<pre><code class="language-text">DB0：5000
+DB1：5000
+DB2：5000
+DB3：5000
+</code></pre>
+<p>这一次，扩展的不只是：</p>
+<pre><code class="language-text">读能力
+</code></pre>
+<p>连：</p>
+<pre><code class="language-text">写能力
+存储容量
+</code></pre>
+<p>都可以水平扩展。</p>
+<p>林默终于明白：</p>
+<blockquote>
+<p>主从主要是在复制数据。</p>
+</blockquote>
+<p>而：</p>
+<blockquote>
+<p>分库是在拆数据。</p>
+</blockquote>
+<p>这是两件完全不同的事情。</p>
+<hr />
+<h2 id="_9">七、最关键的问题来了：一条订单到底放哪？</h2>
+<figure class="architecture"><div class="diagram-frame" tabindex="0" role="region" aria-label="数据分片：先找到数据，再访问分片，可横向滚动"><img alt="数据分片：先找到数据，再访问分片" src="diagrams/database-sharding.svg" /></div><figcaption>数据分片：先找到数据，再访问分片<a href="diagrams/database-sharding.svg" target="_blank" rel="noopener">查看大图 ↗</a></figcaption></figure>
+<p>林默准备了四个库：</p>
+<pre><code class="language-text">DB0
+DB1
+DB2
+DB3
+</code></pre>
+<p>然后突然发现：</p>
+<p>用户下了一个订单：</p>
+<pre><code class="language-text">orderId = 938127
+</code></pre>
+<p>放哪个库？</p>
+<p>不能随机。</p>
+<p>否则以后查询时，你根本不知道它在哪。</p>
+<p>老周说：</p>
+<p>“所以你需要一个分片规则。”</p>
+<h3 id="sharding-key">Sharding Key</h3>
+<p>分片键。</p>
+<hr />
+<h2 id="_10">八、最简单的规则：取模</h2>
+<p>假设根据：</p>
+<pre><code class="language-text">user_id
+</code></pre>
+<p>分库。</p>
+<p>四个库：</p>
+<pre><code class="language-text">DB0
+DB1
+DB2
+DB3
+</code></pre>
+<p>公式：</p>
+<pre><code class="language-text">user_id % 4
+</code></pre>
+<p>例如：</p>
+<pre><code class="language-text">1000 % 4 = 0
+→ DB0
+
+1001 % 4 = 1
+→ DB1
+
+1002 % 4 = 2
+→ DB2
+
+1003 % 4 = 3
+→ DB3
+</code></pre>
+<p>非常简单。</p>
+<p>而且查询用户订单时也很方便。</p>
+<p>例如：</p>
+<pre><code class="language-text">user_id = 1001
+</code></pre>
+<p>直接计算：</p>
+<pre><code class="language-text">1001 % 4 = 1
+</code></pre>
+<p>于是直接：</p>
+<pre><code class="language-text">查 DB1
+</code></pre>
+<p>不用：</p>
+<pre><code class="language-text">DB0、DB1、DB2、DB3 全部查一遍
+</code></pre>
+<hr />
+<h2 id="user_id">九、为什么经常用 user_id 做分片键？</h2>
+<p>订单系统中，经常有一个核心查询：</p>
+<pre><code class="language-text">查询某用户的所有订单
+</code></pre>
+<p>如果按：</p>
+<pre><code class="language-text">user_id
+</code></pre>
+<p>分片，那么同一个用户的数据天然落到同一个库。</p>
+<p>例如：</p>
+<pre><code class="language-text">user 1001 的所有订单
+↓
+DB1
+</code></pre>
+<p>查询很方便。</p>
+<p>但如果你按：</p>
+<pre><code class="language-text">order_id
+</code></pre>
+<p>分片。</p>
+<p>那 user 1001 的订单可能是：</p>
+<pre><code class="language-text">订单 A → DB0
+订单 B → DB3
+订单 C → DB1
+订单 D → DB2
+</code></pre>
+<p>那么：</p>
+<pre><code class="language-text">查询 user 1001 所有订单
+</code></pre>
+<p>就必须：</p>
+<pre><code class="language-text">DB0
+DB1
+DB2
+DB3
+</code></pre>
+<p>全查。</p>
+<p>所以分片键选择本质上取决于：</p>
+<blockquote>
+<p><strong>你的主要访问模式是什么。</strong></p>
+</blockquote>
+<p>这句话非常重要。</p>
+<p>系统设计不是：</p>
+<blockquote>
+<p>“user_id 一定比 order_id 好。”</p>
+</blockquote>
+<p>而是：</p>
+<blockquote>
+<p><strong>根据最重要的查询方式决定数据怎么放。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_11">十、但取模方案埋着一颗炸弹</h2>
+<p>四个库用了两年。</p>
+<p>后来业务继续增长。</p>
+<p>DBA：</p>
+<blockquote>
+<p>“4 个库不够了，加到 8 个吧。”</p>
+</blockquote>
+<p>林默：</p>
+<p>“简单。”</p>
+<p>原来：</p>
+<pre><code class="language-text">user_id % 4
+</code></pre>
+<p>改成：</p>
+<pre><code class="language-text">user_id % 8
+</code></pre>
+<p>然后老周问：</p>
+<p>“那原来的数据呢？”</p>
+<p>林默愣住了。</p>
+<p>例如：</p>
+<pre><code class="language-text">user_id = 1006
+</code></pre>
+<p>以前：</p>
+<pre><code class="language-text">1006 % 4 = 2
+</code></pre>
+<p>所以在：</p>
+<pre><code class="language-text">DB2
+</code></pre>
+<p>扩容之后：</p>
+<pre><code class="language-text">1006 % 8 = 6
+</code></pre>
+<p>现在应该在：</p>
+<pre><code class="language-text">DB6
+</code></pre>
+<p>位置变了。</p>
+<p>再比如：</p>
+<pre><code class="language-text">1007 % 4 = 3
+
+1007 % 8 = 7
+</code></pre>
+<p>也变了。</p>
+<p>实际上，大量数据都会重新定位。</p>
+<p>于是你必须：</p>
+<h3 id="_12">数据迁移</h3>
+<pre><code class="language-text">DB2 的部分数据 → DB6
+DB3 的部分数据 → DB7
+...
+</code></pre>
+<p>而且迁移期间业务还在不断写新订单。</p>
+<p>事情一下子复杂起来。</p>
+<hr />
+<h2 id="_13">十一、扩容为什么是分库分表最痛苦的阶段之一？</h2>
+<p>假设有：</p>
+<pre><code class="language-text">10 TB 数据
+</code></pre>
+<p>现在你要重分片。</p>
+<p>你不能简单：</p>
+<pre><code class="language-text">停机 8 小时
+搬完
+开机
+</code></pre>
+<p>用户不能下单 8 小时，老板可能先把林默搬出去。</p>
+<p>所以通常需要做到：</p>
+<pre><code class="language-text">在线扩容
+</code></pre>
+<p>这意味着迁移过程中：</p>
+<pre><code class="language-text">旧库还在提供服务
+新库也开始接数据
+</code></pre>
+<p>于是出现各种麻烦：</p>
+<pre><code class="language-text">历史数据在哪？
+新数据写哪里？
+迁移中的数据读哪个库？
+如何防止漏数据？
+如何校验一致性？
+什么时候切流量？
+</code></pre>
+<p>老周说：</p>
+<blockquote>
+<p>“真正难的从来不是 userId % N 这一行代码。”</p>
+<p>“而是 N 发生变化以后怎么办。”</p>
+</blockquote>
+<hr />
+<h2 id="_14">十二、一致性哈希登场</h2>
+<p>林默问：</p>
+<p>“有没有一种算法，加机器的时候别让大部分数据都搬家？”</p>
+<p>老周：</p>
+<p>“有。”</p>
+<p>然后画了一个圆。</p>
+<pre><code class="language-text">              0
+         ┌─────────┐
+      15 │         │ 3
+         │         │
+      12 │         │ 6
+         └─────────┘
+              9
+</code></pre>
+<p>林默：</p>
+<p>“钟？”</p>
+<p>“可以这么理解。”</p>
+<p>这叫：</p>
+<h3 id="hash-ring">Hash Ring</h3>
+<p>哈希环。</p>
+<hr />
+<h2 id="_15">十三、把机器放到环上</h2>
+<p>假设：</p>
+<pre><code class="language-text">DB A
+DB B
+DB C
+</code></pre>
+<p>分别经过 Hash：</p>
+<pre><code class="language-text">hash(A)
+hash(B)
+hash(C)
+</code></pre>
+<p>落到环上：</p>
+<pre><code class="language-text">            A
+        ┌───────┐
+     C  │       │
+        │       │
+        └───────┘
+            B
+</code></pre>
+<p>然后数据也 Hash。</p>
+<p>比如：</p>
+<pre><code class="language-text">user1001
+</code></pre>
+<p>经过：</p>
+<pre><code class="language-text">hash(user1001)
+</code></pre>
+<p>也落到环上的某个位置。</p>
+<p>然后规定：</p>
+<blockquote>
+<p><strong>顺时针找到的第一台机器，就是它所属的机器。</strong></p>
+</blockquote>
+<p>例如：</p>
+<pre><code class="language-text">user1001
+   ↓
+   ●
+    \
+     \ 顺时针
+      ↓
+     DB B
+</code></pre>
+<p>那么 user1001 就存 DB B。</p>
+<hr />
+<h2 id="_16">十四、增加一台机器时发生什么？</h2>
+<p>原本：</p>
+<pre><code class="language-text">A
+B
+C
+</code></pre>
+<p>现在增加：</p>
+<pre><code class="language-text">D
+</code></pre>
+<p>D 插到环上的某个位置。</p>
+<p>那么只有：</p>
+<pre><code class="language-text">D 前面那一小段区间
+</code></pre>
+<p>的数据需要移动到 D。</p>
+<p>而不是所有数据重新计算位置。</p>
+<p>这就是一致性哈希最核心的价值：</p>
+<blockquote>
+<p><strong>节点数量变化时，尽量减少数据迁移。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_17">十五、但是一致性哈希也不是万能药</h2>
+<p>林默马上问：</p>
+<p>“那以后分库分表都用一致性哈希不就行了？”</p>
+<p>老周摇头。</p>
+<p>数据库分片中，工程上并不意味着所有场景都会直接采用一致性哈希。</p>
+<p>因为数据库还有很多需求：</p>
+<pre><code class="language-text">范围查询
+事务
+数据迁移
+容量规划
+热点隔离
+运维管理
+</code></pre>
+<p>一致性哈希最经典的应用场景，反而经常出现在：</p>
+<pre><code class="language-text">缓存节点
+分布式存储
+负载分配
+</code></pre>
+<p>比如有：</p>
+<pre><code class="language-text">Redis A
+Redis B
+Redis C
+</code></pre>
+<p>根据 Key 决定去哪个 Redis。</p>
+<p>这时节点动态增加或减少，一致性哈希就非常适合。</p>
+<p>所以面试时不要说：</p>
+<blockquote>
+<p>“分库分表扩容一定用一致性哈希。”</p>
+</blockquote>
+<p>更准确应该是：</p>
+<blockquote>
+<p><strong>一致性哈希是一种减少节点变化时数据重新映射的方案，但具体数据库分片还需要结合业务、路由规则和迁移方案设计。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_18">十六、虚拟节点</h2>
+<p>一致性哈希还有一个问题。</p>
+<p>假设三台机器非常倒霉：</p>
+<pre><code class="language-text">A
+B
+C
+</code></pre>
+<p>Hash 后位置很不均匀。</p>
+<p>比如：</p>
+<pre><code class="language-text">       A
+       |
+       |
+       |
+       B-C
+</code></pre>
+<p>那可能导致：</p>
+<pre><code class="language-text">A 负责 70%
+B 负责 20%
+C 负责 10%
+</code></pre>
+<p>压力严重不均。</p>
+<p>怎么办？</p>
+<p>引入：</p>
+<h3 id="virtual-node">Virtual Node</h3>
+<p>虚拟节点。</p>
+<p>不是让：</p>
+<pre><code class="language-text">A
+</code></pre>
+<p>只在环上出现一次。</p>
+<p>而是：</p>
+<pre><code class="language-text">A1
+A2
+A3
+A4
+...
+</code></pre>
+<p>同样：</p>
+<pre><code class="language-text">B1 B2 B3...
+C1 C2 C3...
+</code></pre>
+<p>这些虚拟节点最终都映射到真实机器。</p>
+<p>这样分布会更加均匀。</p>
+<hr />
+<h2 id="id">十七、另一个问题出现了：ID 冲突</h2>
+<p>分库之前，订单 ID：</p>
+<pre><code class="language-sql">AUTO_INCREMENT
+</code></pre>
+<p>非常舒服。</p>
+<p>比如：</p>
+<pre><code class="language-text">1
+2
+3
+4
+5
+</code></pre>
+<p>但现在：</p>
+<pre><code class="language-text">DB0
+DB1
+DB2
+DB3
+</code></pre>
+<p>都有自己的自增 ID。</p>
+<p>于是：</p>
+<pre><code class="language-text">DB0：
+1
+2
+3
+
+DB1：
+1
+2
+3
+</code></pre>
+<p>合起来：</p>
+<pre><code class="language-text">order_id = 1
+</code></pre>
+<p>出现两次。</p>
+<p>不行。</p>
+<p>于是系统需要：</p>
+<h3 id="id_1">全局唯一 ID</h3>
+<p>Global ID。</p>
+<hr />
+<h2 id="uuid">十八、最简单的方案：UUID</h2>
+<p>每个服务自己生成：</p>
+<pre><code class="language-text">550e8400-e29b-41d4-a716-446655440000
+</code></pre>
+<p>几乎不会冲突。</p>
+<p>优点：</p>
+<pre><code class="language-text">简单
+不依赖中心服务
+全球唯一
+</code></pre>
+<p>缺点也明显：</p>
+<pre><code class="language-text">长
+占空间
+无序
+</code></pre>
+<p>这里主要讨论随机 UUID（例如 v4）；有序 UUID 的索引局部性有所不同。如果把随机 UUID 当 MySQL 主键，B+ Tree 插入位置很随机。</p>
+<p>可能导致：</p>
+<pre><code class="language-text">页分裂
+缓存局部性变差
+索引更大
+</code></pre>
+<p>所以高并发数据库主键一般不太喜欢完全随机的 UUID。</p>
+<hr />
+<h2 id="snowflake">十九、Snowflake 出现了</h2>
+<p>老周写了一个 64 位整数：</p>
+<pre><code class="language-text">186430291234567891
+</code></pre>
+<p>林默：</p>
+<p>“这也是 ID？”</p>
+<p>“对。”</p>
+<p>这类方案最典型的就是：</p>
+<h3 id="snowflake_1">Snowflake</h3>
+<p>雪花算法。</p>
+<p>一个 ID 可以粗略拆成：</p>
+<pre><code class="language-text">| timestamp | machine_id | sequence |
+</code></pre>
+<p>比如：</p>
+<pre><code class="language-text">时间戳
++
+机器编号
++
+当前毫秒内序列号
+</code></pre>
+<p>因此：</p>
+<h3 id="_19">第一，唯一</h3>
+<p>不同机器：</p>
+<pre><code class="language-text">machine_id 不一样
+</code></pre>
+<p>同一机器同一毫秒：</p>
+<pre><code class="language-text">sequence 不一样
+</code></pre>
+<h3 id="_20">第二，趋势递增</h3>
+<p>因为高位通常是时间戳。</p>
+<p>所以后生成的 ID 通常更大。</p>
+<p>这对 B+ Tree 比随机 UUID 友好得多。</p>
+<h3 id="_21">第三，不需要数据库自增</h3>
+<p>每台应用服务器都能自己生成。</p>
+<p>性能很高。</p>
+<hr />
+<h2 id="_22">二十、雪花算法又有坑</h2>
+<p>林默已经学会条件反射了：</p>
+<p>“我猜你接下来要说但是。”</p>
+<p>老周：</p>
+<p>“不错。”</p>
+<p>Snowflake 比较典型的问题之一：</p>
+<h3 id="_23">时钟回拨</h3>
+<p>假设服务器时间：</p>
+<pre><code class="language-text">12:00:00
+</code></pre>
+<p>生成了一批 ID。</p>
+<p>结果 NTP 校时：</p>
+<pre><code class="language-text">时间突然回到了 11:59:58
+</code></pre>
+<p>如果算法处理不好，就可能产生重复 ID。</p>
+<p>所以真实系统要考虑：</p>
+<pre><code class="language-text">时钟回拨检测
+等待
+备用机器号
+逻辑时间
+</code></pre>
+<p>等方案。</p>
+<p>再次说明：</p>
+<blockquote>
+<p>每个优雅算法背后，都有边界条件。</p>
+</blockquote>
+<hr />
+<h2 id="_24">二十一、分库后最麻烦的事开始出现</h2>
+<p>产品经理突然说：</p>
+<blockquote>
+<p>“我要查询昨天所有订单金额前 100 名。”</p>
+</blockquote>
+<p>以前：</p>
+<pre><code class="language-sql">SELECT *
+FROM orders
+WHERE create_time &gt;= ...
+ORDER BY amount DESC
+LIMIT 100;
+</code></pre>
+<p>一个库。</p>
+<p>搞定。</p>
+<p>现在：</p>
+<pre><code class="language-text">DB0
+DB1
+DB2
+DB3
+</code></pre>
+<p>怎么办？</p>
+<p>每个库都可能有前 100 名。</p>
+<p>所以需要：</p>
+<pre><code class="language-text">DB0 → Top 100
+DB1 → Top 100
+DB2 → Top 100
+DB3 → Top 100
+</code></pre>
+<p>然后应用层：</p>
+<pre><code class="language-text">合并
+排序
+取最终 Top 100
+</code></pre>
+<p>分库之后，一些原本简单的 SQL suddenly 变复杂了。</p>
+<hr />
+<h2 id="_25">二十二、分页也出事了</h2>
+<p>产品经理：</p>
+<blockquote>
+<p>“查第 10000 页订单。”</p>
+</blockquote>
+<p>以前：</p>
+<pre><code class="language-sql">LIMIT 100000, 10
+</code></pre>
+<p>已经比较难受。</p>
+<p>分库后更麻烦。</p>
+<p>如果四个库分别有数据：</p>
+<pre><code class="language-text">DB0
+DB1
+DB2
+DB3
+</code></pre>
+<p>你要拿全局：</p>
+<pre><code class="language-text">第 100001 ~ 100010 条
+</code></pre>
+<p>往往不能简单让每个库：</p>
+<pre><code class="language-text">LIMIT 100000,10
+</code></pre>
+<p>因为全局顺序需要合并。</p>
+<p>于是：</p>
+<pre><code class="language-text">跨库分页
+跨库排序
+聚合统计
+</code></pre>
+<p>都会变困难。</p>
+<hr />
+<h2 id="join">二十三、JOIN 也开始崩</h2>
+<p>以前：</p>
+<pre><code class="language-sql">SELECT *
+FROM orders o
+JOIN users u
+ON o.user_id = u.id;
+</code></pre>
+<p>现在：</p>
+<pre><code class="language-text">orders 在 DB3
+
+users 可能在 DB1
+</code></pre>
+<p>MySQL 没法像以前那样轻松本地 JOIN。</p>
+<p>这就是：</p>
+<h3 id="join_1">跨库 JOIN</h3>
+<p>问题。</p>
+<p>常见解决思路包括：</p>
+<pre><code class="language-text">应用层 JOIN
+数据冗余
+搜索引擎
+宽表
+数据仓库
+</code></pre>
+<p>具体选哪个，要看业务。</p>
+<hr />
+<h2 id="_26">二十四、为什么说“分库分表能不做就不做”？</h2>
+<p>林默终于问出了经典问题：</p>
+<p>“既然分库分表这么麻烦，为什么网上一讲大系统就喜欢分库分表？”</p>
+<p>老周：</p>
+<p>“因为网上只画图。”</p>
+<p>林默：</p>
+<p>“……”</p>
+<p>老周认真说：</p>
+<blockquote>
+<p><strong>分库分表不是高级，而是被逼出来的。</strong></p>
+</blockquote>
+<p>在单库还能撑住时：</p>
+<pre><code class="language-text">单库
+</code></pre>
+<p>通常比：</p>
+<pre><code class="language-text">8库64表
+</code></pre>
+<p>好维护得多。</p>
+<p>因为分库分表会引入：</p>
+<pre><code class="language-text">复杂路由
+跨库查询
+跨库事务
+扩容迁移
+全局 ID
+分页排序
+数据一致性
+运维复杂度
+</code></pre>
+<p>所以正确顺序通常不是：</p>
+<pre><code class="language-text">项目刚上线
+↓
+先分 64 个库
+</code></pre>
+<p>而是：</p>
+<pre><code class="language-text">优化 SQL
+↓
+优化索引
+↓
+加缓存
+↓
+读写分离
+↓
+升级硬件
+↓
+确认单库真的成为瓶颈
+↓
+再考虑分库分表
+</code></pre>
+<p>这是非常重要的工程判断。</p>
+<hr />
+<h2 id="_27">二十五、一个面试场景</h2>
+<p>面试官问林默：</p>
+<blockquote>
+<p>“有 10 亿条订单数据，你怎么设计？”</p>
+</blockquote>
+<p>以前林默可能会直接答：</p>
+<blockquote>
+<p>“分库分表，用 userId hash 取模。”</p>
+</blockquote>
+<p>现在他不会这么答了。</p>
+<p>他会先问：</p>
+<pre><code class="language-text">用户量多少？
+QPS 多少？
+读写比例是多少？
+主要查询条件是什么？
+按用户查订单多，还是按订单号查多？
+是否需要全局排序？
+历史订单是否需要实时查询？
+单库目前瓶颈是什么？
+</code></pre>
+<p>因为：</p>
+<blockquote>
+<p><strong>数据量大，不一定等于必须分库。</strong></p>
+</blockquote>
+<p>如果这 10 亿条数据大部分是：</p>
+<pre><code class="language-text">5年前历史数据
+</code></pre>
+<p>可能直接：</p>
+<pre><code class="language-text">冷热分离
+</code></pre>
+<p>把旧数据归档，比立刻分 64 个库更简单。</p>
+<hr />
+<h2 id="_28">二十六、冷热数据分离</h2>
+<p>订单系统里：</p>
+<pre><code class="language-text">最近 3 个月订单
+</code></pre>
+<p>访问特别频繁。</p>
+<p>三年前的订单：</p>
+<pre><code class="language-text">一年可能查一次
+</code></pre>
+<p>那为什么都放在昂贵的在线数据库里？</p>
+<p>可以：</p>
+<pre><code class="language-text">热数据
+↓
+MySQL
+
+冷数据
+↓
+归档库 / 对象存储 / 数仓
+</code></pre>
+<p>用户如果查询三年前订单：</p>
+<pre><code class="language-text">慢一点也可以接受
+</code></pre>
+<p>这样甚至可能避免过早分库。</p>
+<p>系统设计再次回到了那个原则：</p>
+<blockquote>
+<p><strong>根据业务，而不是根据技术名词设计。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_29">二十七、林默重新整理了数据库扩展路线</h2>
+<p>他在白板上写：</p>
+<pre><code class="language-text">第一阶段：
+
+单 MySQL
+</code></pre>
+<p>压力增加：</p>
+<pre><code class="language-text">↓
+索引优化
+SQL 优化
+</code></pre>
+<p>读请求太多：</p>
+<pre><code class="language-text">↓
+Redis
+↓
+主从复制
+↓
+读写分离
+</code></pre>
+<p>单库数据太大：</p>
+<pre><code class="language-text">↓
+归档 / 冷热分离
+</code></pre>
+<p>还不够：</p>
+<pre><code class="language-text">↓
+分表
+</code></pre>
+<p>单机 CPU、IO、写能力也到极限：</p>
+<pre><code class="language-text">↓
+分库
+</code></pre>
+<p>于是形成完整路线：</p>
+<pre><code class="language-text">单库
+ ↓
+缓存
+ ↓
+主从
+ ↓
+读写分离
+ ↓
+冷热分离
+ ↓
+分库分表
+</code></pre>
+<hr />
+<h2 id="_30">二十八、但就在林默准备下班的时候……</h2>
+<p>运营突然跑了进来。</p>
+<p>“出事了！”</p>
+<p>“又怎么了？”</p>
+<p>“今晚秒杀活动。”</p>
+<p>“预计多少人？”</p>
+<p>“200 万。”</p>
+<p>“商品多少件？”</p>
+<p>“1 万件。”</p>
+<p>林默沉默。</p>
+<p>也就是说：</p>
+<pre><code class="language-text">200万人
+同时抢
+1万件商品
+</code></pre>
+<p>哪怕数据库已经分库。</p>
+<p>瞬间可能仍然出现：</p>
+<pre><code class="language-text">几十万 QPS
+</code></pre>
+<p>请求像洪水一样同时冲进系统。</p>
+<p>数据库可能还没来得及慢慢处理，就已经被连接打爆。</p>
+<p>林默问：</p>
+<p>“继续加数据库？”</p>
+<p>老周摇头。</p>
+<p>“你现在的问题，不是总处理能力不够。”</p>
+<p>“而是——”</p>
+<p>他在白板上画了一条巨大的尖峰：</p>
+<pre><code class="language-text">QPS
+
+        /\
+       /  \
+      /    \
+_____/      \_____
+</code></pre>
+<p>“流量在某一瞬间太高。”</p>
+<p>林默看着这座尖峰。</p>
+<p>突然想起一个词。</p>
+<blockquote>
+<p><strong>削峰。</strong></p>
+</blockquote>
+<p>老周点点头。</p>
+<p>然后在数据库前面画了一个盒子：</p>
+<pre><code class="language-text">用户
+ ↓
+App
+ ↓
+？？？
+ ↓
+MySQL
+</code></pre>
+<p>盒子里面写着：</p>
+<h3 id="message-queue">Message Queue</h3>
+<p>消息队列。</p>
+<hr />
+<h2 id="_31">第四章结束</h2>
+<p>现在整个系统已经继续进化：</p>
+<pre><code class="language-text">                         ┌→ App 1
+用户 → Load Balancer ────┼→ App 2
+                         └→ App 3
+                              │
+                       ┌──────┴──────┐
+                       │             │
+                     Redis       DB Router
+                                     │
+                    ┌────────────────┼────────────────┐
+                    ▼                ▼                ▼
+                  Shard 0          Shard 1          Shard 2
+                    │                │                │
+                 Replica          Replica          Replica
+</code></pre>
+<p>这一章真正需要记住的是这条因果链：</p>
+<pre><code class="language-text">单表越来越大
+↓
+分表
+↓
+单机资源仍然有限
+↓
+分库
+↓
+需要决定数据放哪
+↓
+Sharding Key
+↓
+Hash / 取模
+↓
+扩容导致大量数据重新映射
+↓
+一致性哈希可以减少节点变化时的数据迁移
+↓
+分库后自增 ID 冲突
+↓
+全局 ID / Snowflake
+↓
+跨库 JOIN、排序、分页、事务变复杂
+↓
+所以分库分表不是越早越好
+</code></pre>
+<p>你现在已经有一个很关键的系统设计直觉了：</p>
+<blockquote>
+<p><strong>水平扩展解决容量问题，但会把原本单机内部的问题，变成分布式协调问题。</strong></p>
+</blockquote>
+<p>下一章我们就接秒杀事故：</p>
+<h3 id="_32">下一章：两百万人同时按下购买键——消息队列、削峰与异步化</h3>
+<p>会自然串起：</p>
+<p><strong>为什么要 MQ → 削峰填谷 → 同步转异步 → Kafka / RabbitMQ 的角色 → 消息丢失 → 重复消费 → 幂等 → 顺序消息 → 消息积压 → 最终一致性。</strong></p>
+<p>行，下一章。</p></article><nav class="chapter-nav" aria-label="章节切换"><a href="chapter-03.html" rel="prev">← 上一章</a><a href="chapter-05.html" rel="next">下一章 →</a></nav></main></div><footer>系统设计：从一台服务器开始<br><small>现有 8 章 · 连载中 · 第九章待续</small><p><a href="editorial.html">整理说明与技术参考</a> · <a href="https://github.com/wupzl/system-design-reader">项目源码 ↗</a></p></footer></body></html>

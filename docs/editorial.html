@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="description" content="系统设计：从一台服务器开始。跟随林默与老周，在八章故事中理解缓存、数据库、消息队列与分布式共识。连载中，第九章待续。"><title>整理说明与技术参考 · 系统设计</title><script>try{document.documentElement.dataset.theme=localStorage.getItem('reader-theme')||'white';document.documentElement.style.setProperty('--reading-size',Math.max(16,Math.min(26,Number(localStorage.getItem('reader-size'))||18))+'px')}catch(e){}</script><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="shelf-nav.css"><link rel="stylesheet" href="reader.css"><script src="app.js" defer></script></head>
+<body class=""><a class="skip" href="#main">跳到正文</a><header><a class="brand" href="index.html">系统设计<span>SYSTEM DESIGN</span></a><nav class="shelf-nav" aria-label="学习项目导航"><a class="shelf-home" href="/">← 学习书架</a><details class="shelf-switch"><summary>切换项目 ▾</summary><div class="shelf-menu"><a href="/pytorch-apprentice/">PyTorch：炼金术士的学徒</a><a href="/ai-era-reader/">AI 纪元</a><a href="/data-empire-reader/">数据帝国</a><a href="/rag-empire-reader/">RAG 帝国</a><a href="/system-design-reader/" aria-current="page">系统设计</a></div></details></nav><div class="controls"><button id="smaller" aria-label="缩小字号" type="button">A−</button><button id="larger" aria-label="增大字号" type="button">A＋</button><button id="theme" aria-label="切换阅读背景" type="button">纯白</button></div></header>
+<main class="home standalone" id="main"><a href="index.html">← 全书目录</a><article><h1 id="_1">整理说明与技术参考</h1>
+<p>本书以《系统设计：从一台服务器开始》原稿为基础，保留林默与老周的完整故事、人物对话、代码示例和知识点。现有八章，连载中；第九章《订单成功了，库存却没扣——分布式事务》仅保留预告。</p>
+<h2 id="_2">内容如何整理</h2>
+<p>清理章间“下一章”等对话残留和重复书名，统一章节、节标题与概念标题的层级。保留短句叙事和各章总结。关键架构图改为本地 SVG，部分图附有可展开的文字版；其余字符图继续保留等宽排版。</p>
+<p>原稿完整存档于仓库的 <code>source/original.md</code>，整理后的正文位于 <code>chapters/</code>。后续修改以整理后的 Markdown 为准，不会在网站重建时覆盖正文。</p>
+<h2 id="_3">技术修订与补充</h2>
+<p>以下内容已在相关段落直接调整或以“工程补充”说明。核对时间为 2026 年 10 月 25 日；具体 API 和配置须以实际使用的软件版本为准。</p>
+<ul>
+<li><strong>第一章</strong>：区分 Web 请求量与数据库查询量的 QPS 语境；水平扩展不保证吞吐随实例数线性增长。</li>
+<li><strong>第二章</strong>：说明浏览器、CDN、Redis 和数据库与 CPU 缓存层级只是类比；布隆过滤器的否定结论只适用于已正确加入集合的数据；重建缓存的伪代码加入获锁后重查、有限重试、TTL、唯一 token 和安全释放，说明租约过期的局限。</li>
+<li><strong>第三章</strong>：区分 binlog 的语句与行格式；重新绘制读写路由，避免把全部读请求画成先经过主库；说明半同步复制确认 relay log 接收刷盘，不代表事务已在副本应用，也不消除读延迟或自动完成故障切换。</li>
+<li><strong>第四章</strong>：随机 UUID 与有序 UUID 的索引局部性不同，不把所有 UUID 一概视为随机主键。</li>
+<li><strong>第五章</strong>：区分发布确认、消费确认和业务完成；说明 RabbitMQ 确认与 Kafka offset 提交的差别；去重记录与业务变更需要同一事务及唯一约束；Redis 预扣库存与发 MQ 之间仍存在失败窗口，前台受理不等于成单。</li>
+<li><strong>第七章</strong>：补充 DNS 缓存与健康检查对切换时延的影响，以及多地域容灾的容量、RPO 和 RTO 验证要求。</li>
+<li><strong>第八章</strong>：修正“强一致使性能、可用性都非常高”的笔误；多数派交集需要结合协议规则；Raft 的当前任期提交、状态机应用、旧 Leader 和线性一致读均有额外条件；栅栏令牌必须由资源端原子执行校验与写入。</li>
+</ul>
+<p>故事中的 CPU、QPS、延迟与数据量用于解释场景和计算方法，不是经过压测的产品性能指标。示例代码用于解释设计，具体实现需要结合事务、失败处理和实际客户端接口。</p>
+<h2 id="_4">参考资料</h2>
+<ul>
+<li><a href="https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/">Redis：分布式锁</a>：唯一锁值、租约与安全释放。</li>
+<li><a href="https://redis.io/docs/latest/develop/data-types/probabilistic/bloom-filter/">Redis：布隆过滤器</a>：概率集合的查询语义。</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.4/en/replication-formats.html">MySQL 8.4：复制格式</a>：语句、行与混合日志格式。</li>
+<li><a href="https://dev.mysql.com/doc/refman/8.4/en/replication-semisync.html">MySQL 8.4：半同步复制</a>：副本确认、超时与异步回退。</li>
+<li><a href="https://www.rabbitmq.com/docs/confirms">RabbitMQ：消费者确认与发布者确认</a>：发布确认与业务处理的不同边界。</li>
+<li><a href="https://kafka.apache.org/41/design/design/">Apache Kafka 4.1：设计</a>：日志保留、消费者位置与消息投递语义。</li>
+<li><a href="https://raft.github.io/raft.pdf">Raft 论文（扩展版）</a>：选举限制、日志复制、提交规则与客户端交互。</li>
+</ul>
+<h2 id="_5">阅读设置</h2>
+<p>网页无需登录，无运行时外部依赖。支持手机和桌面、章内目录、上下章切换、字号调整，以及纯白、米白和深色三种背景。字号与背景只存储在当前浏览器。图表在窄屏可横向滚动，也可打开大图。</p></article></main><footer>系统设计：从一台服务器开始<br><small>现有 8 章 · 连载中 · 第九章待续</small><p><a href="editorial.html">整理说明与技术参考</a> · <a href="https://github.com/wupzl/system-design-reader">项目源码 ↗</a></p></footer></body></html>

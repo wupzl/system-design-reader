@@ -1,0 +1,1257 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="description" content="系统设计：从一台服务器开始。跟随林默与老周，在八章故事中理解缓存、数据库、消息队列与分布式共识。连载中，第九章待续。"><title>两百万人同时按下购买键——消息队列、削峰与异步化 · 系统设计</title><script>try{document.documentElement.dataset.theme=localStorage.getItem('reader-theme')||'white';document.documentElement.style.setProperty('--reading-size',Math.max(16,Math.min(26,Number(localStorage.getItem('reader-size'))||18))+'px')}catch(e){}</script><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="shelf-nav.css"><link rel="stylesheet" href="reader.css"><script src="app.js" defer></script></head>
+<body class="reading"><a class="skip" href="#main">跳到正文</a><header><a class="brand" href="index.html">系统设计<span>SYSTEM DESIGN</span></a><nav class="shelf-nav" aria-label="学习项目导航"><a class="shelf-home" href="/">← 学习书架</a><details class="shelf-switch"><summary>切换项目 ▾</summary><div class="shelf-menu"><a href="/pytorch-apprentice/">PyTorch：炼金术士的学徒</a><a href="/ai-era-reader/">AI 纪元</a><a href="/data-empire-reader/">数据帝国</a><a href="/rag-empire-reader/">RAG 帝国</a><a href="/system-design-reader/" aria-current="page">系统设计</a></div></details></nav><div class="controls"><button id="smaller" aria-label="缩小字号" type="button">A−</button><button id="larger" aria-label="增大字号" type="button">A＋</button><button id="theme" aria-label="切换阅读背景" type="button">纯白</button></div></header>
+<div class="reader-layout"><aside><a href="index.html">← 全书目录</a><p class="eyebrow">本章导航</p><div class="toc">
+<ul>
+<li><a href="#_1">一、真正的问题不是“总请求太多”</a></li>
+<li><a href="#5000">二、如果一次只能处理 5000 个怎么办？</a></li>
+<li><a href="#_3">三、消息队列正式登场</a></li>
+<li><a href="#_5">四、为什么叫削峰填谷？</a></li>
+<li><a href="#_6">五、这就是系统设计里一个极重要的思想：缓冲</a></li>
+<li><a href="#_7">六、同步调用为什么危险？</a></li>
+<li><a href="#_8">七、异步化</a></li>
+<li><a href="#_10">八、同步和异步到底差在哪？</a></li>
+<li><a href="#mq">九、MQ 的三个核心价值</a></li>
+<li><a href="#1">1. 削峰</a></li>
+<li><a href="#2">2. 异步</a></li>
+<li><a href="#3">3. 解耦</a></li>
+<li><a href="#mq_1">十、但 MQ 一上线，新的问题立刻来了</a></li>
+<li><a href="#_12">十一、第一种事故：消息丢失</a></li>
+<li><a href="#producer_1">十二、Producer 怎么保证消息真的发出去？</a></li>
+<li><a href="#broker_1">十三、Broker 怎么保证不丢？</a></li>
+<li><a href="#consumer_1">十四、Consumer 怎么保证处理完再确认？</a></li>
+<li><a href="#_14">十五、但是“消息不丢”马上带来另一个问题</a></li>
+<li><a href="#mq_2">十六、为什么很多 MQ 做不到“绝对只消费一次”？</a></li>
+<li><a href="#_17">十七、什么叫幂等？</a></li>
+<li><a href="#_18">十八、如何做消费幂等？</a></li>
+<li><a href="#_20">十九、数据库唯一索引也能做幂等</a></li>
+<li><a href="#_21">二十、消息顺序又出问题了</a></li>
+<li><a href="#_23">二十一、顺序消息怎么做？</a></li>
+<li><a href="#kafka-partition">二十二、Kafka 为什么总提 Partition？</a></li>
+<li><a href="#rabbitmq-kafka">二十三、RabbitMQ 和 Kafka 怎么理解？</a></li>
+<li><a href="#_26">二十四、然后消息开始积压</a></li>
+<li><a href="#_28">二十五、消息积压怎么办？</a></li>
+<li><a href="#_29">二十六、这引出了背压</a></li>
+<li><a href="#mq_3">二十七、MQ 不能创造吞吐量</a></li>
+<li><a href="#_30">二十八、最难的问题来了：数据库成功，消息发送失败</a></li>
+<li><a href="#outbox-pattern">二十九、Outbox Pattern</a></li>
+<li><a href="#_32">三十、为什么这个方案靠谱？</a></li>
+<li><a href="#_33">三十一、最终一致性再次出现</a></li>
+<li><a href="#_35">三十二、回到秒杀</a></li>
+<li><a href="#redis">三十三、但是为什么先扣 Redis 库存？</a></li>
+<li><a href="#_36">三十四、为什么必须“原子扣库存”？</a></li>
+<li><a href="#_37">三十五、系统现在已经非常像一个真正的大型系统</a></li>
+<li><a href="#_38">第五章结束</a></li>
+</ul>
+</div>
+</aside><main id="main"><div class="chapter-heading"><p class="eyebrow">CHAPTER 05 / 08 · 连载中</p><h1>两百万人同时按下购买键——消息队列、削峰与异步化</h1><p>削峰填谷 · 可靠投递 · 消费幂等</p></div><details class="mobile-toc"><summary>展开本章目录</summary><div class="toc">
+<ul>
+<li><a href="#_1">一、真正的问题不是“总请求太多”</a></li>
+<li><a href="#5000">二、如果一次只能处理 5000 个怎么办？</a></li>
+<li><a href="#_3">三、消息队列正式登场</a></li>
+<li><a href="#_5">四、为什么叫削峰填谷？</a></li>
+<li><a href="#_6">五、这就是系统设计里一个极重要的思想：缓冲</a></li>
+<li><a href="#_7">六、同步调用为什么危险？</a></li>
+<li><a href="#_8">七、异步化</a></li>
+<li><a href="#_10">八、同步和异步到底差在哪？</a></li>
+<li><a href="#mq">九、MQ 的三个核心价值</a></li>
+<li><a href="#1">1. 削峰</a></li>
+<li><a href="#2">2. 异步</a></li>
+<li><a href="#3">3. 解耦</a></li>
+<li><a href="#mq_1">十、但 MQ 一上线，新的问题立刻来了</a></li>
+<li><a href="#_12">十一、第一种事故：消息丢失</a></li>
+<li><a href="#producer_1">十二、Producer 怎么保证消息真的发出去？</a></li>
+<li><a href="#broker_1">十三、Broker 怎么保证不丢？</a></li>
+<li><a href="#consumer_1">十四、Consumer 怎么保证处理完再确认？</a></li>
+<li><a href="#_14">十五、但是“消息不丢”马上带来另一个问题</a></li>
+<li><a href="#mq_2">十六、为什么很多 MQ 做不到“绝对只消费一次”？</a></li>
+<li><a href="#_17">十七、什么叫幂等？</a></li>
+<li><a href="#_18">十八、如何做消费幂等？</a></li>
+<li><a href="#_20">十九、数据库唯一索引也能做幂等</a></li>
+<li><a href="#_21">二十、消息顺序又出问题了</a></li>
+<li><a href="#_23">二十一、顺序消息怎么做？</a></li>
+<li><a href="#kafka-partition">二十二、Kafka 为什么总提 Partition？</a></li>
+<li><a href="#rabbitmq-kafka">二十三、RabbitMQ 和 Kafka 怎么理解？</a></li>
+<li><a href="#_26">二十四、然后消息开始积压</a></li>
+<li><a href="#_28">二十五、消息积压怎么办？</a></li>
+<li><a href="#_29">二十六、这引出了背压</a></li>
+<li><a href="#mq_3">二十七、MQ 不能创造吞吐量</a></li>
+<li><a href="#_30">二十八、最难的问题来了：数据库成功，消息发送失败</a></li>
+<li><a href="#outbox-pattern">二十九、Outbox Pattern</a></li>
+<li><a href="#_32">三十、为什么这个方案靠谱？</a></li>
+<li><a href="#_33">三十一、最终一致性再次出现</a></li>
+<li><a href="#_35">三十二、回到秒杀</a></li>
+<li><a href="#redis">三十三、但是为什么先扣 Redis 库存？</a></li>
+<li><a href="#_36">三十四、为什么必须“原子扣库存”？</a></li>
+<li><a href="#_37">三十五、系统现在已经非常像一个真正的大型系统</a></li>
+<li><a href="#_38">第五章结束</a></li>
+</ul>
+</div>
+</details><article><p>晚上 7 点 59 分 50 秒。</p>
+<p>秒杀活动页面已经打开。</p>
+<p>商品：</p>
+<pre><code class="language-text">某款热门显卡
+库存：10000
+</code></pre>
+<p>预约人数：</p>
+<pre><code class="language-text">2,000,000
+</code></pre>
+<p>林默盯着监控。</p>
+<p>QPS 还很低。</p>
+<pre><code class="language-text">300
+500
+800
+</code></pre>
+<p>8 点整。</p>
+<p>所有人同时点下：</p>
+<pre><code class="language-text">立即购买
+</code></pre>
+<p>监控图瞬间变成：</p>
+<pre><code class="language-text">QPS
+
+            /\
+           /  \
+          /    \
+_________/      \________
+</code></pre>
+<p>峰值：</p>
+<pre><code class="language-text">280,000 QPS
+</code></pre>
+<p>数据库连接池：</p>
+<pre><code class="language-text">200/200
+</code></pre>
+<p>应用线程：</p>
+<pre><code class="language-text">全部占满
+</code></pre>
+<p>MySQL：</p>
+<pre><code class="language-text">CPU 100%
+</code></pre>
+<p>然后开始：</p>
+<pre><code class="language-text">timeout
+timeout
+timeout
+</code></pre>
+<p>整个系统像被一拳打懵。</p>
+<hr />
+<h2 id="_1">一、真正的问题不是“总请求太多”</h2>
+<p>林默第一反应：</p>
+<p>“是不是机器太少？”</p>
+<p>老周问：</p>
+<p>“这 200 万个请求，是一直这么多吗？”</p>
+<p>“不，主要就是 8 点那几分钟。”</p>
+<p>“那你为了 5 分钟流量，准备平时养几百台机器？”</p>
+<p>林默沉默。</p>
+<p>这时老周画了一条线：</p>
+<pre><code class="language-text">正常流量：
+
+____----____----____
+
+秒杀流量：
+
+___________/\___________
+</code></pre>
+<p>他说：</p>
+<blockquote>
+<p>“你现在的问题，不是一天处理不了这么多请求。”</p>
+</blockquote>
+<p>而是：</p>
+<blockquote>
+<p><strong>请求在同一时间涌进来了。</strong></p>
+</blockquote>
+<p>这就是：</p>
+<h3 id="_2">流量尖峰</h3>
+<p>Traffic Spike。</p>
+<hr />
+<h2 id="5000">二、如果一次只能处理 5000 个怎么办？</h2>
+<p>假设数据库稳定承受：</p>
+<pre><code class="language-text">5000 requests/s
+</code></pre>
+<p>但一瞬间来了：</p>
+<pre><code class="language-text">200000 requests/s
+</code></pre>
+<p>直接硬扛：</p>
+<pre><code class="language-text">200000
+   ↓
+MySQL
+</code></pre>
+<p>必炸。</p>
+<p>老周问：</p>
+<p>“如果这些请求不要求立刻执行呢？”</p>
+<p>林默：</p>
+<p>“什么意思？”</p>
+<p>“先排队。”</p>
+<hr />
+<h2 id="_3">三、消息队列正式登场</h2>
+<p>老周在系统中间画了一个盒子：</p>
+<pre><code class="language-text">用户
+ ↓
+App
+ ↓
+Message Queue
+ ↓
+Consumer
+ ↓
+MySQL
+</code></pre>
+<p>用户请求不再直接冲数据库。</p>
+<p>而是：</p>
+<pre><code class="language-text">用户
+ ↓
+把“下单请求”写入队列
+ ↓
+立即返回“处理中”
+</code></pre>
+<p>后台消费者慢慢处理：</p>
+<pre><code class="language-text">MQ
+ ↓
+5000/s
+ ↓
+MySQL
+</code></pre>
+<p>于是原本：</p>
+<pre><code class="language-text">200000/s
+   ↓
+MySQL
+</code></pre>
+<p>变成：</p>
+<pre><code class="language-text">200000/s
+   ↓
+MQ
+   ↓
+5000/s
+   ↓
+MySQL
+</code></pre>
+<p>数据库终于可以喘气。</p>
+<p>这就是：</p>
+<h3 id="_4">削峰填谷</h3>
+<p>Peak Shaving。</p>
+<hr />
+<h2 id="_5">四、为什么叫削峰填谷？</h2>
+<p>想象水库。</p>
+<p>暴雨来了：</p>
+<pre><code class="language-text">上游洪水
+↓↓↓↓↓↓↓↓↓↓
+</code></pre>
+<p>如果直接冲下游：</p>
+<pre><code class="language-text">洪水
+↓
+城市
+↓
+淹了
+</code></pre>
+<p>加一个水库：</p>
+<pre><code class="language-text">洪水
+ ↓
+水库
+ ↓
+慢慢放水
+ ↓
+城市
+</code></pre>
+<p>消息队列在系统里就是这个水库。</p>
+<p>请求高峰时：</p>
+<pre><code class="language-text">先积在 MQ
+</code></pre>
+<p>流量低谷时：</p>
+<pre><code class="language-text">Consumer 继续处理
+</code></pre>
+<p>于是：</p>
+<blockquote>
+<p><strong>把瞬时压力，变成一段时间内的稳定压力。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_6">五、这就是系统设计里一个极重要的思想：缓冲</h2>
+<p>其实你之前已经见过类似思想。</p>
+<p>比如：</p>
+<pre><code class="language-text">CPU 和内存速度不一致
+↓
+Cache
+</code></pre>
+<p>生产者和消费者速度不一致：</p>
+<pre><code class="language-text">Producer 太快
+Consumer 太慢
+↓
+Queue
+</code></pre>
+<p>所以 MQ 本质上不仅是“发消息”。</p>
+<p>它还是一个：</p>
+<h3 id="buffer">Buffer</h3>
+<p>缓冲层。</p>
+<hr />
+<h2 id="_7">六、同步调用为什么危险？</h2>
+<p>原来下单流程：</p>
+<pre><code class="language-text">用户点击下单
+ ↓
+创建订单
+ ↓
+扣库存
+ ↓
+扣优惠券
+ ↓
+发短信
+ ↓
+发邮件
+ ↓
+写积分
+ ↓
+记录日志
+ ↓
+返回成功
+</code></pre>
+<p>假设每一步：</p>
+<pre><code class="language-text">创建订单 50ms
+扣库存   30ms
+优惠券   40ms
+短信     200ms
+邮件     300ms
+积分     50ms
+</code></pre>
+<p>总延迟：</p>
+<pre><code class="language-text">670ms+
+</code></pre>
+<p>而且只要邮件服务挂了：</p>
+<pre><code class="language-text">用户下单失败？
+</code></pre>
+<p>这显然很奇怪。</p>
+<p>用户买东西，为什么要等邮件发完？</p>
+<hr />
+<h2 id="_8">七、异步化</h2>
+<p>于是老周把流程拆成：</p>
+<pre><code class="language-text">用户
+ ↓
+创建订单
+ ↓
+扣库存
+ ↓
+返回成功
+</code></pre>
+<p>同时发送消息：</p>
+<pre><code class="language-text">OrderCreated
+</code></pre>
+<p>然后：</p>
+<pre><code class="language-text">                ┌→ 短信服务
+                ├→ 邮件服务
+OrderCreated → MQ ├→ 积分服务
+                └→ 日志服务
+</code></pre>
+<p>用户无需等待后续流程完成。</p>
+<p>这叫：</p>
+<h3 id="_9">异步化</h3>
+<p>Asynchronous Processing。</p>
+<hr />
+<h2 id="_10">八、同步和异步到底差在哪？</h2>
+<p>同步：</p>
+<pre><code class="language-text">A → B → C → D
+
+A 必须等 B
+B 必须等 C
+C 必须等 D
+</code></pre>
+<p>任何一环慢：</p>
+<pre><code class="language-text">整条链路慢
+</code></pre>
+<p>任何一环挂：</p>
+<pre><code class="language-text">整条链路可能失败
+</code></pre>
+<p>异步：</p>
+<pre><code class="language-text">A → MQ
+
+然后：
+
+MQ → B
+MQ → C
+MQ → D
+</code></pre>
+<p>A 把消息放进去就可以继续。</p>
+<p>于是系统获得：</p>
+<pre><code class="language-text">更低响应延迟
+更好的解耦
+更强的抗峰值能力
+</code></pre>
+<hr />
+<h2 id="mq">九、MQ 的三个核心价值</h2>
+<p>林默总结：</p>
+<h2 id="1">1. 削峰</h2>
+<pre><code class="language-text">瞬时 20 万 QPS
+↓
+MQ
+↓
+稳定 5000 QPS 消费
+</code></pre>
+<h2 id="2">2. 异步</h2>
+<pre><code class="language-text">非核心流程
+不阻塞用户请求
+</code></pre>
+<h2 id="3">3. 解耦</h2>
+<p>原来：</p>
+<pre><code class="language-text">订单服务
+ ↓
+短信服务
+ ↓
+邮件服务
+ ↓
+积分服务
+</code></pre>
+<p>订单服务需要知道所有下游。</p>
+<p>现在：</p>
+<pre><code class="language-text">订单服务
+ ↓
+MQ
+</code></pre>
+<p>下游自己订阅。</p>
+<p>订单服务甚至不需要知道：</p>
+<pre><code class="language-text">到底有几个消费者
+</code></pre>
+<hr />
+<h2 id="mq_1">十、但 MQ 一上线，新的问题立刻来了</h2>
+<p>某天用户付款成功。</p>
+<p>订单服务发送：</p>
+<pre><code class="language-text">PaymentSuccess
+</code></pre>
+<p>准备让履约服务发货。</p>
+<p>结果：</p>
+<pre><code class="language-text">订单服务
+ ↓
+发送消息
+ ↓
+网络断了
+</code></pre>
+<p>消息没进 MQ。</p>
+<p>数据库里：</p>
+<pre><code class="language-text">订单 = 已支付
+</code></pre>
+<p>但下游永远没收到：</p>
+<pre><code class="language-text">PaymentSuccess
+</code></pre>
+<p>于是：</p>
+<pre><code class="language-text">钱扣了
+货没发
+</code></pre>
+<p>林默脸色变了。</p>
+<p>老周：</p>
+<blockquote>
+<p>“消息队列最难的地方，从来不是 send()。”</p>
+</blockquote>
+<p>而是：</p>
+<h3 id="_11">消息可靠性</h3>
+<hr />
+<h2 id="_12">十一、第一种事故：消息丢失</h2>
+<p>消息可能在哪丢？</p>
+<p>整条链路：</p>
+<pre><code class="language-text">Producer
+ ↓
+Broker
+ ↓
+Consumer
+</code></pre>
+<p>三个地方都可能出事。</p>
+<h3 id="producer">Producer 丢</h3>
+<pre><code class="language-text">发送失败
+</code></pre>
+<h3 id="broker">Broker 丢</h3>
+<pre><code class="language-text">消息刚进内存
+MQ 宕机
+</code></pre>
+<h3 id="consumer">Consumer 丢</h3>
+<pre><code class="language-text">消费者拿到消息
+还没处理完
+就确认成功
+然后进程挂了
+</code></pre>
+<p>所以要保证可靠性，就必须考虑整个链路。</p>
+<hr />
+<h2 id="producer_1">十二、Producer 怎么保证消息真的发出去？</h2>
+<p>最简单：</p>
+<pre><code class="language-text">send(message)
+</code></pre>
+<p>不够。</p>
+<p>通常需要：</p>
+<pre><code class="language-text">发送
+↓
+等待 Broker ACK
+↓
+确认收到
+</code></pre>
+<p>如果没有 ACK：</p>
+<pre><code class="language-text">重试
+</code></pre>
+<p>于是：</p>
+<pre><code class="language-text">Producer
+  ↓
+Broker
+  ↓
+ACK
+</code></pre>
+<p>这样 Producer 才知道：</p>
+<blockquote>
+<p>“Broker 已按当前确认配置接收了消息；这还不代表消费者已处理成功。”</p>
+</blockquote>
+<hr />
+<h2 id="broker_1">十三、Broker 怎么保证不丢？</h2>
+<p>如果 MQ 只是把消息放内存：</p>
+<pre><code class="language-text">RAM
+</code></pre>
+<p>机器断电：</p>
+<pre><code class="language-text">消息没了
+</code></pre>
+<p>所以重要消息通常需要：</p>
+<h3 id="_13">持久化</h3>
+<p>Persistence。</p>
+<p>比如写入：</p>
+<pre><code class="language-text">磁盘日志
+</code></pre>
+<p>并且 Broker 本身最好：</p>
+<pre><code class="language-text">多副本
+</code></pre>
+<p>这样一台机器挂了：</p>
+<pre><code class="language-text">Replica 还有数据
+</code></pre>
+<hr />
+<h2 id="consumer_1">十四、Consumer 怎么保证处理完再确认？</h2>
+<p>错误流程：</p>
+<pre><code class="language-text">Consumer 收到消息
+↓
+立刻 ACK
+↓
+开始处理
+↓
+程序崩溃
+</code></pre>
+<p>对于 RabbitMQ 这类任务队列，Broker 可以把已确认的投递标记为可删除。Kafka 的 offset 提交含义不同：它推进消费位置，消息仍由保留策略管理。</p>
+<p>消息永久消失。</p>
+<p>所以更合理：</p>
+<pre><code class="language-text">Consumer 收到消息
+↓
+处理业务
+↓
+成功
+↓
+ACK
+</code></pre>
+<p>如果处理过程中挂了：</p>
+<pre><code class="language-text">Broker 没收到 ACK
+↓
+重新投递
+</code></pre>
+<p>这样消息就不容易丢。</p>
+<hr />
+<h2 id="_14">十五、但是“消息不丢”马上带来另一个问题</h2>
+<p>林默很满意。</p>
+<p>“那就重试，保证不丢。”</p>
+<p>老周：</p>
+<p>“那你考虑过重复吗？”</p>
+<p>例如：</p>
+<pre><code class="language-text">Consumer 已经处理成功
+</code></pre>
+<p>库存扣了：</p>
+<pre><code class="language-text">100 → 99
+</code></pre>
+<p>然后准备 ACK。</p>
+<p>就在此时：</p>
+<pre><code class="language-text">网络断了
+</code></pre>
+<p>Broker 没收到 ACK。</p>
+<p>于是：</p>
+<pre><code class="language-text">重新发送这条消息
+</code></pre>
+<p>Consumer 又执行一次：</p>
+<pre><code class="language-text">99 → 98
+</code></pre>
+<p>但实际上只卖了一件商品。</p>
+<p>这就是：</p>
+<h3 id="_15">重复消费</h3>
+<hr />
+<h2 id="mq_2">十六、为什么很多 MQ 做不到“绝对只消费一次”？</h2>
+<p>在分布式系统里有一个非常麻烦的窗口：</p>
+<pre><code class="language-text">业务执行成功
+↓
+ACK 还没成功
+</code></pre>
+<p>如果这时崩溃：</p>
+<p>系统很难判断：</p>
+<pre><code class="language-text">到底业务执行了没有？
+</code></pre>
+<p>所以工程上非常常见的语义是：</p>
+<h3 id="at-least-once">At Least Once</h3>
+<p>至少一次。</p>
+<p>意思是：</p>
+<pre><code class="language-text">在持久化、确认与重试等条件满足时争取至少处理一次
+可能重复，仍需处理失败、过期与重试耗尽
+</code></pre>
+<p>既然可能重复，那业务就必须：</p>
+<h3 id="_16">幂等</h3>
+<p>Idempotency。</p>
+<hr />
+<h2 id="_17">十七、什么叫幂等？</h2>
+<p>一个操作执行：</p>
+<pre><code class="language-text">1 次
+</code></pre>
+<p>和：</p>
+<pre><code class="language-text">10 次
+</code></pre>
+<p>结果一样。</p>
+<p>这就是幂等。</p>
+<p>比如：</p>
+<pre><code class="language-sql">UPDATE orders
+SET status = 'PAID'
+WHERE id = 123;
+</code></pre>
+<p>执行一次：</p>
+<pre><code class="language-text">PAID
+</code></pre>
+<p>执行十次：</p>
+<pre><code class="language-text">还是 PAID
+</code></pre>
+<p>这种天然比较幂等。</p>
+<p>但：</p>
+<pre><code class="language-sql">UPDATE account
+SET balance = balance - 100
+WHERE id = 1;
+</code></pre>
+<p>执行一次：</p>
+<pre><code class="language-text">1000 → 900
+</code></pre>
+<p>执行两次：</p>
+<pre><code class="language-text">1000 → 800
+</code></pre>
+<p>这就不幂等。</p>
+<hr />
+<h2 id="_18">十八、如何做消费幂等？</h2>
+<p>最常见的办法之一：</p>
+<p>每条业务消息有唯一 ID。</p>
+<p>比如：</p>
+<pre><code class="language-text">message_id = abc123
+</code></pre>
+<p>Consumer 处理前：</p>
+<pre><code class="language-text">查询 abc123 是否处理过
+</code></pre>
+<p>如果处理过：</p>
+<pre><code class="language-text">直接跳过
+</code></pre>
+<p>没处理：</p>
+<pre><code class="language-text">执行业务
+↓
+记录 abc123 已处理
+</code></pre>
+<p>例如：</p>
+<pre><code class="language-text">processed_message
+
+abc123
+abc124
+abc125
+</code></pre>
+<p>这就是：</p>
+<h3 id="_19">去重</h3>
+<p>Deduplication。</p>
+<blockquote>
+<p><strong>工程补充</strong>：“先查再做再记录”只表达思路，不能单独保证并发幂等。需要唯一约束，并将去重记录和业务更新放在同一个本地事务中；若涉及外部副作用，还需使用对方的幂等键或设计补偿、对账。</p>
+</blockquote>
+<hr />
+<h2 id="_20">十九、数据库唯一索引也能做幂等</h2>
+<p>比如优惠券发放：</p>
+<pre><code class="language-text">user_id
+coupon_id
+</code></pre>
+<p>建立唯一索引：</p>
+<pre><code class="language-sql">UNIQUE(user_id, coupon_id)
+</code></pre>
+<p>消息重复消费：</p>
+<p>第一次：</p>
+<pre><code class="language-text">插入成功
+</code></pre>
+<p>第二次：</p>
+<pre><code class="language-text">唯一索引冲突
+</code></pre>
+<p>于是系统知道：</p>
+<pre><code class="language-text">已经处理过
+</code></pre>
+<p>这比单纯：</p>
+<pre><code class="language-text">先查再插
+</code></pre>
+<p>更可靠。</p>
+<p>因为并发下：</p>
+<pre><code class="language-text">查
+↓
+都发现没有
+↓
+同时插
+</code></pre>
+<p>可能还是重复。</p>
+<p>所以：</p>
+<blockquote>
+<p><strong>唯一约束往往是幂等设计的重要兜底。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_21">二十、消息顺序又出问题了</h2>
+<p>某个订单状态依次变化：</p>
+<pre><code class="language-text">CREATED
+↓
+PAID
+↓
+SHIPPED
+↓
+FINISHED
+</code></pre>
+<p>MQ 收到：</p>
+<pre><code class="language-text">消息1：PAID
+消息2：SHIPPED
+</code></pre>
+<p>结果由于多个消费者并发：</p>
+<pre><code class="language-text">Consumer A 处理 SHIPPED
+Consumer B 处理 PAID
+</code></pre>
+<p>最终状态可能变成：</p>
+<pre><code class="language-text">PAID
+</code></pre>
+<p>订单竟然从已发货退回已支付。</p>
+<p>这就是：</p>
+<h3 id="_22">消息乱序</h3>
+<hr />
+<h2 id="_23">二十一、顺序消息怎么做？</h2>
+<p>如果要求：</p>
+<pre><code class="language-text">同一个订单
+</code></pre>
+<p>的消息必须有序。</p>
+<p>可以让相同：</p>
+<pre><code class="language-text">order_id
+</code></pre>
+<p>路由到同一个队列或同一个分区。</p>
+<p>例如：</p>
+<pre><code class="language-text">hash(order_id) % partition_count
+</code></pre>
+<p>所以：</p>
+<pre><code class="language-text">order123 的所有消息
+↓
+Partition 2
+</code></pre>
+<p>再由单一逻辑顺序消费。</p>
+<p>这样：</p>
+<pre><code class="language-text">CREATED
+PAID
+SHIPPED
+FINISHED
+</code></pre>
+<p>才能按序处理。</p>
+<p>注意这里的关键词：</p>
+<blockquote>
+<p><strong>通常保证的是“局部有序”，不是整个系统所有消息全局有序。</strong></p>
+</blockquote>
+<p>因为全局有序意味着：</p>
+<pre><code class="language-text">所有消息
+↓
+一个队列
+↓
+一个消费者
+</code></pre>
+<p>吞吐量会非常差。</p>
+<hr />
+<h2 id="kafka-partition">二十二、Kafka 为什么总提 Partition？</h2>
+<p>林默这时终于理解 Kafka 的一个核心设计。</p>
+<p>假设一个 Topic：</p>
+<pre><code class="language-text">orders
+</code></pre>
+<p>只有一个 Partition。</p>
+<p>那么：</p>
+<pre><code class="language-text">吞吐受一个 Partition 限制
+</code></pre>
+<p>把它拆成：</p>
+<pre><code class="language-text">Partition 0
+Partition 1
+Partition 2
+Partition 3
+</code></pre>
+<p>不同消息可以并行处理。</p>
+<p>例如：</p>
+<pre><code class="language-text">user/order hash
+↓
+不同 Partition
+</code></pre>
+<p>这样获得：</p>
+<pre><code class="language-text">更高吞吐
+</code></pre>
+<p>同时：</p>
+<blockquote>
+<p><strong>单个 Partition 内仍可以保持顺序。</strong></p>
+</blockquote>
+<p>于是：</p>
+<pre><code class="language-text">并行性
+和
+局部顺序
+</code></pre>
+<p>得到一个平衡。</p>
+<hr />
+<h2 id="rabbitmq-kafka">二十三、RabbitMQ 和 Kafka 怎么理解？</h2>
+<p>这里先不背详细区别。</p>
+<p>用故事理解。</p>
+<p>RabbitMQ 更像：</p>
+<h3 id="_24">快递分拣中心</h3>
+<p>你发一个任务：</p>
+<pre><code class="language-text">请处理这个订单
+</code></pre>
+<p>Broker 负责把任务交给消费者。</p>
+<p>常见强调：</p>
+<pre><code class="language-text">路由
+确认
+消费
+队列语义
+</code></pre>
+<p>适合很多：</p>
+<pre><code class="language-text">业务异步任务
+</code></pre>
+<hr />
+<p>Kafka 更像：</p>
+<h3 id="_25">巨型日志流水带</h3>
+<p>消息不断追加：</p>
+<pre><code class="language-text">offset 1
+offset 2
+offset 3
+offset 4
+...
+</code></pre>
+<p>消费者记录自己读到哪里：</p>
+<pre><code class="language-text">offset = 10086
+</code></pre>
+<p>因此非常适合：</p>
+<pre><code class="language-text">超高吞吐
+日志
+事件流
+数据管道
+Event Streaming
+</code></pre>
+<p>这只是直觉层面的区别。</p>
+<p>并不是说：</p>
+<pre><code class="language-text">RabbitMQ 不能高吞吐
+Kafka 不能做业务消息
+</code></pre>
+<p>而是二者设计重心不同。</p>
+<hr />
+<h2 id="_26">二十四、然后消息开始积压</h2>
+<p>秒杀结束。</p>
+<p>林默发现 MQ 监控：</p>
+<pre><code class="language-text">Queue Length:
+
+100万
+300万
+800万
+1200万
+</code></pre>
+<p>消费者：</p>
+<pre><code class="language-text">消费速度：5000/s
+</code></pre>
+<p>生产者：</p>
+<pre><code class="language-text">生产速度：30000/s
+</code></pre>
+<p>结果显然：</p>
+<pre><code class="language-text">每秒多积压 25000 条
+</code></pre>
+<p>这叫：</p>
+<h3 id="_27">消息积压</h3>
+<p>Message Backlog。</p>
+<hr />
+<h2 id="_28">二十五、消息积压怎么办？</h2>
+<p>先找原因。</p>
+<p>可能：</p>
+<pre><code class="language-text">Consumer 太少
+</code></pre>
+<p>那就增加消费者。</p>
+<pre><code class="language-text">Consumer 1
+Consumer 2
+Consumer 3
+...
+</code></pre>
+<p>如果 Topic 有足够 Partition，就可以并行消费。</p>
+<hr />
+<p>也可能：</p>
+<pre><code class="language-text">单条消息处理太慢
+</code></pre>
+<p>比如每条：</p>
+<pre><code class="language-text">200ms
+</code></pre>
+<p>那要优化：</p>
+<pre><code class="language-text">数据库
+外部 RPC
+批处理
+IO
+</code></pre>
+<hr />
+<p>也可能下游已经到极限。</p>
+<p>例如数据库最多：</p>
+<pre><code class="language-text">5000/s
+</code></pre>
+<p>你就算开：</p>
+<pre><code class="language-text">1000 个 Consumer
+</code></pre>
+<p>也没用。</p>
+<p>反而所有消费者一起打数据库：</p>
+<pre><code class="language-text">数据库再次挂掉
+</code></pre>
+<p>所以系统设计绝不能：</p>
+<blockquote>
+<p>“积压了就无脑加消费者。”</p>
+</blockquote>
+<p>必须找真正瓶颈。</p>
+<hr />
+<h2 id="_29">二十六、这引出了背压</h2>
+<p>如果消费者已经处理不过来，生产者是不是还应该无限往里塞？</p>
+<p>不一定。</p>
+<p>需要：</p>
+<h3 id="backpressure">Backpressure</h3>
+<p>背压。</p>
+<p>本质是：</p>
+<blockquote>
+<p><strong>下游告诉上游：我已经吃不下了，你慢一点。</strong></p>
+</blockquote>
+<p>比如：</p>
+<pre><code class="language-text">Consumer 处理不过来
+↓
+Queue 过长
+↓
+上游限流
+</code></pre>
+<p>或者：</p>
+<pre><code class="language-text">拒绝非关键请求
+降级
+</code></pre>
+<p>这和生活里很像。</p>
+<p>餐厅厨房只能做：</p>
+<pre><code class="language-text">100 单/小时
+</code></pre>
+<p>前台却接：</p>
+<pre><code class="language-text">10000 单/小时
+</code></pre>
+<p>队列再大也只是：</p>
+<blockquote>
+<p>延迟死亡。</p>
+</blockquote>
+<hr />
+<h2 id="mq_3">二十七、MQ 不能创造吞吐量</h2>
+<p>老周特别强调：</p>
+<blockquote>
+<p>“消息队列只是把压力推迟。”</p>
+</blockquote>
+<p>假设数据库一天最多处理：</p>
+<pre><code class="language-text">1 亿条
+</code></pre>
+<p>你每天送进 MQ：</p>
+<pre><code class="language-text">10 亿条
+</code></pre>
+<p>那队列最终一定：</p>
+<pre><code class="language-text">无限增长
+</code></pre>
+<p>MQ 能解决：</p>
+<pre><code class="language-text">瞬时峰值
+</code></pre>
+<p>不能解决：</p>
+<pre><code class="language-text">长期处理能力不足
+</code></pre>
+<p>这点非常重要。</p>
+<hr />
+<h2 id="_30">二十八、最难的问题来了：数据库成功，消息发送失败</h2>
+<p>某天下单。</p>
+<p>代码：</p>
+<pre><code class="language-text">1. INSERT order
+2. send OrderCreated
+</code></pre>
+<p>第一步：</p>
+<pre><code class="language-text">数据库成功
+</code></pre>
+<p>第二步：</p>
+<pre><code class="language-text">MQ 发送失败
+</code></pre>
+<p>于是：</p>
+<pre><code class="language-text">订单存在
+</code></pre>
+<p>但：</p>
+<pre><code class="language-text">下游永远不知道
+</code></pre>
+<p>如果反过来：</p>
+<pre><code class="language-text">1. send OrderCreated
+2. INSERT order
+</code></pre>
+<p>第一步成功。</p>
+<p>第二步数据库失败。</p>
+<p>于是下游收到：</p>
+<pre><code class="language-text">一个根本不存在的订单
+</code></pre>
+<p>林默开始头疼。</p>
+<p>这其实是：</p>
+<h3 id="_31">本地事务与消息的一致性问题</h3>
+<hr />
+<h2 id="outbox-pattern">二十九、Outbox Pattern</h2>
+<p>老周给了一个非常经典的方案。</p>
+<p>不要直接：</p>
+<pre><code class="language-text">事务提交
++
+发送 MQ
+</code></pre>
+<p>而是在同一个数据库事务里写两张表：</p>
+<pre><code class="language-text">BEGIN;
+
+INSERT INTO orders ...;
+
+INSERT INTO outbox(
+    event_type,
+    payload,
+    status
+) ...;
+
+COMMIT;
+</code></pre>
+<p>于是：</p>
+<pre><code class="language-text">订单
+和
+待发送消息
+</code></pre>
+<p>要么一起成功。</p>
+<p>要么一起失败。</p>
+<p>之后一个后台任务：</p>
+<pre><code class="language-text">扫描 outbox
+↓
+发送 MQ
+↓
+发送成功
+↓
+标记 SENT
+</code></pre>
+<p>这叫：</p>
+<h3 id="transactional-outbox">Transactional Outbox</h3>
+<p>事务 Outbox。</p>
+<hr />
+<h2 id="_32">三十、为什么这个方案靠谱？</h2>
+<p>因为：</p>
+<pre><code class="language-text">orders
+</code></pre>
+<p>和：</p>
+<pre><code class="language-text">outbox
+</code></pre>
+<p>在同一个 MySQL 本地事务里。</p>
+<p>MySQL 可以保证：</p>
+<pre><code class="language-text">原子性
+</code></pre>
+<p>于是避免：</p>
+<pre><code class="language-text">业务提交了
+消息却完全没记录
+</code></pre>
+<p>至于 MQ 发送可能重复？</p>
+<p>没关系。</p>
+<p>我们前面已经解决：</p>
+<pre><code class="language-text">Consumer 幂等
+</code></pre>
+<p>你会发现系统设计很多方案是连锁的。</p>
+<hr />
+<h2 id="_33">三十一、最终一致性再次出现</h2>
+<p>订单创建后：</p>
+<pre><code class="language-text">订单 DB
+</code></pre>
+<p>已经成功。</p>
+<p>积分系统可能：</p>
+<pre><code class="language-text">100ms 后
+</code></pre>
+<p>才更新。</p>
+<p>短信：</p>
+<pre><code class="language-text">1 秒后
+</code></pre>
+<p>才发送。</p>
+<p>推荐系统：</p>
+<pre><code class="language-text">5 秒后
+</code></pre>
+<p>才看到这个事件。</p>
+<p>它们不是同一时刻一致。</p>
+<p>但最终都会追上。</p>
+<p>这就是：</p>
+<h3 id="_34">最终一致性</h3>
+<p>又出现了。</p>
+<p>你现在应该开始看到：</p>
+<blockquote>
+<p><strong>最终一致性不是某一个技术点，而是大型分布式系统经常采用的一种取舍。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_35">三十二、回到秒杀</h2>
+<p>现在林默重新设计秒杀流程。</p>
+<p>用户来了：</p>
+<figure class="architecture"><div class="diagram-frame" tabindex="0" role="region" aria-label="用消息队列缓冲瞬时流量，可横向滚动"><img alt="用消息队列缓冲瞬时流量" src="diagrams/queue-buffering.svg" /></div><figcaption>用消息队列缓冲瞬时流量<a href="diagrams/queue-buffering.svg" target="_blank" rel="noopener">查看大图 ↗</a></figcaption></figure>
+<details class="original-diagram">
+<summary>查看文字版示意</summary>
+<pre><code class="language-text">请求
+ ↓
+限流
+ ↓
+Redis 原子扣减库存
+ ↓
+成功
+ ↓
+发送 MQ
+ ↓
+返回“请求已受理，订单确认中”
+</code></pre>
+</details>
+<p>后台：</p>
+<pre><code class="language-text">MQ
+ ↓
+创建订单
+ ↓
+支付
+ ↓
+履约
+</code></pre>
+<p>这样最危险的数据库写入不会直接面对：</p>
+<pre><code class="language-text">20 万 QPS
+</code></pre>
+<p>而是由 MQ 平滑处理。</p>
+<hr />
+<h2 id="redis">三十三、但是为什么先扣 Redis 库存？</h2>
+<p>如果 200 万人抢 1 万件。</p>
+<p>你没必要让：</p>
+<pre><code class="language-text">199 万个失败请求
+</code></pre>
+<p>全进 MQ。</p>
+<p>更好的做法：</p>
+<pre><code class="language-text">Redis stock = 10000
+</code></pre>
+<p>用户请求先执行原子操作：</p>
+<pre><code class="language-text">if stock &gt; 0:
+    stock--
+    success
+else:
+    sold out
+</code></pre>
+<p>只有前 1 万左右成功请求：</p>
+<pre><code class="language-text">进入 MQ
+</code></pre>
+<p>于是：</p>
+<pre><code class="language-text">200 万请求
+↓
+Redis
+↓
+1 万成功
+↓
+MQ
+↓
+DB
+</code></pre>
+<p>流量在前面就被截断。</p>
+<blockquote>
+<p><strong>工程补充</strong>：Redis 预扣与 MQ 发送不构成跨系统原子事务。发送失败、订单创建失败或支付超时都可能留下预占库存，需要可靠事件记录、幂等补偿、预占超时与对账；受理成功不能直接等同于最终下单成功。</p>
+</blockquote>
+<p>这就是系统设计里的另一条重要原则：</p>
+<blockquote>
+<p><strong>越便宜的过滤越往前放。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_36">三十四、为什么必须“原子扣库存”？</h2>
+<p>如果这样写：</p>
+<pre><code class="language-text">1. GET stock
+2. 判断 stock &gt; 0
+3. SET stock = stock - 1
+</code></pre>
+<p>两个请求同时：</p>
+<pre><code class="language-text">A GET → 1
+B GET → 1
+</code></pre>
+<p>然后：</p>
+<pre><code class="language-text">A SET → 0
+B SET → 0
+</code></pre>
+<p>两个人都认为自己抢到了最后一件。</p>
+<p>这就是并发竞态。</p>
+<p>所以需要：</p>
+<pre><code class="language-text">Redis Lua
+</code></pre>
+<p>把：</p>
+<pre><code class="language-text">判断
++
+扣减
+</code></pre>
+<p>放进一个原子操作。</p>
+<p>这其实已经非常接近真实高并发权益/秒杀系统的设计了。</p>
+<hr />
+<h2 id="_37">三十五、系统现在已经非常像一个真正的大型系统</h2>
+<p>现在架构：</p>
+<pre><code class="language-text">                            ┌→ App 1
+Client → Load Balancer ─────┼→ App 2
+                            └→ App 3
+                                 │
+                          ┌──────┴──────┐
+                          │             │
+                       Redis           MQ
+                          │             │
+                      快速判断        Consumer
+                                        │
+                                        ▼
+                                     DB Shards
+</code></pre>
+<p>Redis：</p>
+<pre><code class="language-text">挡热点请求
+库存原子扣减
+Session
+缓存
+</code></pre>
+<p>MQ：</p>
+<pre><code class="language-text">削峰
+异步
+解耦
+</code></pre>
+<p>DB：</p>
+<pre><code class="language-text">最终持久化业务数据
+</code></pre>
+<p>你会发现它们不是：</p>
+<pre><code class="language-text">随便堆中间件
+</code></pre>
+<p>而是每一层解决不同问题。</p>
+<hr />
+<h2 id="_38">第五章结束</h2>
+<p>这一章最重要的因果链是：</p>
+<pre><code class="language-text">瞬时流量过高
+↓
+数据库扛不住
+↓
+消息队列
+↓
+削峰填谷
+↓
+异步化
+↓
+系统解耦
+↓
+消息可能丢失
+↓
+ACK + 持久化 + 重试
+↓
+重试导致重复消息
+↓
+幂等
+↓
+并发消费导致乱序
+↓
+分区内顺序
+↓
+消费者处理不过来
+↓
+消息积压
+↓
+扩消费者 / 优化下游 / 背压
+↓
+DB 和 MQ 无法天然一个事务
+↓
+Outbox
+↓
+最终一致性
+</code></pre>
+<p>面试遇到：</p>
+<blockquote>
+<p>“上游突然 10 万 QPS，但下游只能处理 500 QPS 怎么办？”</p>
+</blockquote>
+<p>现在不要只回答一句：</p>
+<blockquote>
+<p>“用 MQ 削峰。”</p>
+</blockquote>
+<p>更完整的逻辑应该是：</p>
+<blockquote>
+<p><strong>先判断这是短时尖峰还是持续流量。如果是短时尖峰，可以通过消息队列把同步请求转为异步任务，让上游快速入队，下游按自身处理能力稳定消费，实现削峰填谷。但还需要考虑队列容量、消息积压、消费并发、消息可靠性和幂等。如果长期生产速率高于消费速率，MQ 只能延迟问题，还必须扩展下游真实处理能力。</strong></p>
+</blockquote>
+<p>下一章我们继续处理这个系统最危险的问题：</p>
+<h3 id="_39">下一章：门外已经挤了两百万人——限流、熔断、降级与雪崩</h3>
+<p>到时候会把：</p>
+<p><strong>固定窗口、滑动窗口、漏桶、令牌桶、Redis 限流、429、熔断器、Circuit Breaker、Fallback、服务雪崩、超时、重试风暴、隔离</strong></p>
+<p>全部放进一次真正的“大规模事故”里。</p></article><nav class="chapter-nav" aria-label="章节切换"><a href="chapter-04.html" rel="prev">← 上一章</a><a href="chapter-06.html" rel="next">下一章 →</a></nav></main></div><footer>系统设计：从一台服务器开始<br><small>现有 8 章 · 连载中 · 第九章待续</small><p><a href="editorial.html">整理说明与技术参考</a> · <a href="https://github.com/wupzl/system-design-reader">项目源码 ↗</a></p></footer></body></html>

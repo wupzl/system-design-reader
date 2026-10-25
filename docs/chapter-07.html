@@ -1,0 +1,1260 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="description" content="系统设计：从一台服务器开始。跟随林默与老周，在八章故事中理解缓存、数据库、消息队列与分布式共识。连载中，第九章待续。"><title>服务器明明没挂，为什么用户还是觉得“慢”？——DNS、CDN 与多地域访问 · 系统设计</title><script>try{document.documentElement.dataset.theme=localStorage.getItem('reader-theme')||'white';document.documentElement.style.setProperty('--reading-size',Math.max(16,Math.min(26,Number(localStorage.getItem('reader-size'))||18))+'px')}catch(e){}</script><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="shelf-nav.css"><link rel="stylesheet" href="reader.css"><script src="app.js" defer></script></head>
+<body class="reading"><a class="skip" href="#main">跳到正文</a><header><a class="brand" href="index.html">系统设计<span>SYSTEM DESIGN</span></a><nav class="shelf-nav" aria-label="学习项目导航"><a class="shelf-home" href="/">← 学习书架</a><details class="shelf-switch"><summary>切换项目 ▾</summary><div class="shelf-menu"><a href="/pytorch-apprentice/">PyTorch：炼金术士的学徒</a><a href="/ai-era-reader/">AI 纪元</a><a href="/data-empire-reader/">数据帝国</a><a href="/rag-empire-reader/">RAG 帝国</a><a href="/system-design-reader/" aria-current="page">系统设计</a></div></details></nav><div class="controls"><button id="smaller" aria-label="缩小字号" type="button">A−</button><button id="larger" aria-label="增大字号" type="button">A＋</button><button id="theme" aria-label="切换阅读背景" type="button">纯白</button></div></header>
+<div class="reader-layout"><aside><a href="index.html">← 全书目录</a><p class="eyebrow">本章导航</p><div class="toc">
+<ul>
+<li><a href="#_1">一、用户访问网站，第一步到底发生了什么？</a></li>
+<li><a href="#dns_1">二、DNS 可以理解成互联网的电话簿</a></li>
+<li><a href="#dns_2">三、DNS 查询也不是直接问“互联网总部”</a></li>
+<li><a href="#ttl">四、TTL</a></li>
+<li><a href="#dns-ip">五、DNS 不只是“域名转 IP”</a></li>
+<li><a href="#_3">六、可是图片为什么还是慢？</a></li>
+<li><a href="#cdn">七、CDN 出现</a></li>
+<li><a href="#cdn_2">八、CDN 的本质是什么？</a></li>
+<li><a href="#cdn_3">九、第一次访问 CDN 会发生什么？</a></li>
+<li><a href="#cdn_4">十、为什么 CDN 能显著减少源站压力？</a></li>
+<li><a href="#cdn_5">十一、静态资源为什么特别适合 CDN？</a></li>
+<li><a href="#_5">十二、前后端分离之后，这个结构尤其明显</a></li>
+<li><a href="#_6">十三、缓存多久？</a></li>
+<li><a href="#cdn_6">十四、CDN 缓存一致性</a></li>
+<li><a href="#_7">十五、但是有一个更漂亮的办法：文件指纹</a></li>
+<li><a href="#_8">十六、这其实又是一个系统设计思想</a></li>
+<li><a href="#html">十七、HTML 为什么通常不能缓存一年？</a></li>
+<li><a href="#etag">十八、ETag 又是什么？</a></li>
+<li><a href="#cdn_7">十九、浏览器缓存和 CDN 缓存不是一回事</a></li>
+<li><a href="#_9">二十、多级缓存为什么快？</a></li>
+<li><a href="#cdn_8">二十一、但是 CDN 节点自己挂了怎么办？</a></li>
+<li><a href="#_10">二十二、系统有多个机房之后会发生什么？</a></li>
+<li><a href="#_12">二十三、可是数据库怎么办？</a></li>
+<li><a href="#_13">二十四、多地域真正难的是数据</a></li>
+<li><a href="#active-passive">二十五、Active-Passive</a></li>
+<li><a href="#active-active">二十六、Active-Active</a></li>
+<li><a href="#rpo-rto">二十七、RPO 和 RTO</a></li>
+<li><a href="#rto">二十八、RTO</a></li>
+<li><a href="#rpo0rto0">二十九、为什么 RPO=0、RTO=0 很贵？</a></li>
+<li><a href="#999-9999">三十、99.9% 和 99.99% 到底差多少？</a></li>
+<li><a href="#200">三十一、可是“服务器返回 200”就算可用吗？</a></li>
+<li><a href="#_14">三十二、平均延迟会骗人</a></li>
+<li><a href="#_15">三十三、长尾延迟</a></li>
+<li><a href="#_16">三十四、现在整个请求终于可以完整走一遍了</a></li>
+<li><a href="#_17">三十五、从第一章到现在，其实一直只有几个问题</a></li>
+<li><a href="#_26">三十六、系统设计真正的六个问题</a></li>
+<li><a href="#_27">第七章结束</a></li>
+</ul>
+</div>
+</aside><main id="main"><div class="chapter-heading"><p class="eyebrow">CHAPTER 07 / 08 · 连载中</p><h1>服务器明明没挂，为什么用户还是觉得“慢”？——DNS、CDN 与多地域访问</h1><p>DNS · CDN · 多地域与容灾</p></div><details class="mobile-toc"><summary>展开本章目录</summary><div class="toc">
+<ul>
+<li><a href="#_1">一、用户访问网站，第一步到底发生了什么？</a></li>
+<li><a href="#dns_1">二、DNS 可以理解成互联网的电话簿</a></li>
+<li><a href="#dns_2">三、DNS 查询也不是直接问“互联网总部”</a></li>
+<li><a href="#ttl">四、TTL</a></li>
+<li><a href="#dns-ip">五、DNS 不只是“域名转 IP”</a></li>
+<li><a href="#_3">六、可是图片为什么还是慢？</a></li>
+<li><a href="#cdn">七、CDN 出现</a></li>
+<li><a href="#cdn_2">八、CDN 的本质是什么？</a></li>
+<li><a href="#cdn_3">九、第一次访问 CDN 会发生什么？</a></li>
+<li><a href="#cdn_4">十、为什么 CDN 能显著减少源站压力？</a></li>
+<li><a href="#cdn_5">十一、静态资源为什么特别适合 CDN？</a></li>
+<li><a href="#_5">十二、前后端分离之后，这个结构尤其明显</a></li>
+<li><a href="#_6">十三、缓存多久？</a></li>
+<li><a href="#cdn_6">十四、CDN 缓存一致性</a></li>
+<li><a href="#_7">十五、但是有一个更漂亮的办法：文件指纹</a></li>
+<li><a href="#_8">十六、这其实又是一个系统设计思想</a></li>
+<li><a href="#html">十七、HTML 为什么通常不能缓存一年？</a></li>
+<li><a href="#etag">十八、ETag 又是什么？</a></li>
+<li><a href="#cdn_7">十九、浏览器缓存和 CDN 缓存不是一回事</a></li>
+<li><a href="#_9">二十、多级缓存为什么快？</a></li>
+<li><a href="#cdn_8">二十一、但是 CDN 节点自己挂了怎么办？</a></li>
+<li><a href="#_10">二十二、系统有多个机房之后会发生什么？</a></li>
+<li><a href="#_12">二十三、可是数据库怎么办？</a></li>
+<li><a href="#_13">二十四、多地域真正难的是数据</a></li>
+<li><a href="#active-passive">二十五、Active-Passive</a></li>
+<li><a href="#active-active">二十六、Active-Active</a></li>
+<li><a href="#rpo-rto">二十七、RPO 和 RTO</a></li>
+<li><a href="#rto">二十八、RTO</a></li>
+<li><a href="#rpo0rto0">二十九、为什么 RPO=0、RTO=0 很贵？</a></li>
+<li><a href="#999-9999">三十、99.9% 和 99.99% 到底差多少？</a></li>
+<li><a href="#200">三十一、可是“服务器返回 200”就算可用吗？</a></li>
+<li><a href="#_14">三十二、平均延迟会骗人</a></li>
+<li><a href="#_15">三十三、长尾延迟</a></li>
+<li><a href="#_16">三十四、现在整个请求终于可以完整走一遍了</a></li>
+<li><a href="#_17">三十五、从第一章到现在，其实一直只有几个问题</a></li>
+<li><a href="#_26">三十六、系统设计真正的六个问题</a></li>
+<li><a href="#_27">第七章结束</a></li>
+</ul>
+</div>
+</details><article><p>林默最近遇到了一个很奇怪的问题。</p>
+<p>北京用户：</p>
+<pre><code class="language-text">打开首页：120ms
+</code></pre>
+<p>上海用户：</p>
+<pre><code class="language-text">180ms
+</code></pre>
+<p>广州用户：</p>
+<pre><code class="language-text">600ms
+</code></pre>
+<p>新加坡用户：</p>
+<pre><code class="language-text">1.3s
+</code></pre>
+<p>美国用户：</p>
+<pre><code class="language-text">2.4s
+</code></pre>
+<p>林默看服务器监控：</p>
+<pre><code class="language-text">CPU：22%
+MySQL：正常
+Redis：正常
+MQ：正常
+</code></pre>
+<p>“系统又没过载，为什么国外用户这么慢？”</p>
+<p>老周看了他一眼。</p>
+<p>“因为你之前解决的，都是服务器里面的问题。”</p>
+<p>“现在该解决——”</p>
+<blockquote>
+<p><strong>服务器和用户之间的问题了。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_1">一、用户访问网站，第一步到底发生了什么？</h2>
+<p>用户在浏览器里输入：</p>
+<pre><code class="language-text">www.example.com
+</code></pre>
+<p>林默下意识说：</p>
+<p>“请求发送到服务器。”</p>
+<p>老周：</p>
+<p>“服务器 IP 是多少？”</p>
+<p>林默停住了。</p>
+<p>域名：</p>
+<pre><code class="language-text">www.example.com
+</code></pre>
+<p>并不是一个 IP 地址。</p>
+<p>真正网络通信最终需要的是：</p>
+<pre><code class="language-text">203.0.113.10
+</code></pre>
+<p>所以用户访问网站之前，要先解决一个问题：</p>
+<blockquote>
+<p><strong>这个域名对应哪台服务器？</strong></p>
+</blockquote>
+<p>这就是：</p>
+<h3 id="dns">DNS</h3>
+<p>Domain Name System。</p>
+<hr />
+<h2 id="dns_1">二、DNS 可以理解成互联网的电话簿</h2>
+<p>你知道一个人的名字：</p>
+<pre><code class="language-text">林默
+</code></pre>
+<p>但打电话需要：</p>
+<pre><code class="language-text">138xxxxxxx
+</code></pre>
+<p>DNS 做的就是：</p>
+<pre><code class="language-text">www.example.com
+        ↓
+203.0.113.10
+</code></pre>
+<p>于是完整流程其实是：</p>
+<pre><code class="language-text">用户输入域名
+   ↓
+DNS 查询
+   ↓
+得到服务器 IP
+   ↓
+建立 TCP/QUIC 连接
+   ↓
+TLS 握手
+   ↓
+HTTP 请求
+</code></pre>
+<p>还没进入你的 Spring Boot，</p>
+<p>前面已经走了很多步。</p>
+<hr />
+<h2 id="dns_2">三、DNS 查询也不是直接问“互联网总部”</h2>
+<p>林默问：</p>
+<p>“DNS 到底问谁？”</p>
+<p>老周画：</p>
+<pre><code class="language-text">浏览器缓存
+    ↓
+操作系统缓存
+    ↓
+本地 DNS Resolver
+    ↓
+根 DNS
+    ↓
+顶级域 DNS
+    ↓
+权威 DNS
+</code></pre>
+<p>实际流程有缓存，不一定每次都走到底。</p>
+<p>比如查询：</p>
+<pre><code class="language-text">www.example.com
+</code></pre>
+<p>如果浏览器已经缓存：</p>
+<pre><code class="language-text">www.example.com → 203.0.113.10
+</code></pre>
+<p>直接使用。</p>
+<p>没有的话，再问系统或者 DNS Resolver。</p>
+<hr />
+<h2 id="ttl">四、TTL</h2>
+<p>DNS 结果不会永远缓存。</p>
+<p>比如：</p>
+<pre><code class="language-text">TTL = 300 秒
+</code></pre>
+<p>意思是：</p>
+<blockquote>
+<p>这条 DNS 解析结果可以缓存 5 分钟。</p>
+</blockquote>
+<p>5 分钟后：</p>
+<pre><code class="language-text">重新查询
+</code></pre>
+<p>林默马上想到：</p>
+<p>“那 TTL 设置长一点不是更快？”</p>
+<p>“是。”</p>
+<p>“那就设一年。”</p>
+<p>老周：</p>
+<p>“如果你换服务器 IP 呢？”</p>
+<p>林默：</p>
+<p>“……”</p>
+<p>TTL 越长：</p>
+<pre><code class="language-text">DNS 查询更少
+缓存效果更好
+</code></pre>
+<p>但是：</p>
+<pre><code class="language-text">变更生效更慢
+</code></pre>
+<p>TTL 越短：</p>
+<pre><code class="language-text">变更更灵活
+</code></pre>
+<p>但：</p>
+<pre><code class="language-text">DNS 查询更多
+</code></pre>
+<p>又一次取舍。</p>
+<hr />
+<h2 id="dns-ip">五、DNS 不只是“域名转 IP”</h2>
+<p>几个月后，公司有两个机房：</p>
+<pre><code class="language-text">北京机房
+上海机房
+</code></pre>
+<p>北京用户访问：</p>
+<pre><code class="language-text">北京机房更近
+</code></pre>
+<p>上海用户：</p>
+<pre><code class="language-text">上海机房更近
+</code></pre>
+<p>DNS 完全可以根据：</p>
+<pre><code class="language-text">用户地理位置
+网络运营商
+服务健康状态
+</code></pre>
+<p>返回不同 IP。</p>
+<p>例如：</p>
+<pre><code class="language-text">北京用户：
+www.example.com
+→ 北京 IP
+
+上海用户：
+www.example.com
+→ 上海 IP
+</code></pre>
+<p>于是 DNS 开始承担：</p>
+<h3 id="_2">流量调度</h3>
+<p>Traffic Steering。</p>
+<p>这时候 DNS 已经不只是“电话簿”。</p>
+<p>它还是：</p>
+<blockquote>
+<p><strong>互联网入口的导航系统。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_3">六、可是图片为什么还是慢？</h2>
+<p>系统已经能让用户访问比较近的机房。</p>
+<p>但首页有：</p>
+<pre><code class="language-text">logo.png
+banner.jpg
+app.js
+vendor.js
+style.css
+video.mp4
+</code></pre>
+<p>其中一个视频：</p>
+<pre><code class="language-text">100 MB
+</code></pre>
+<p>美国用户请求北京服务器：</p>
+<pre><code class="language-text">America
+   ↓
+太平洋海底光缆
+   ↓
+China
+   ↓
+Origin Server
+</code></pre>
+<p>光传播再快，也不能瞬移。</p>
+<p>更别说中间还有：</p>
+<pre><code class="language-text">路由器
+运营商
+拥塞
+丢包
+跨境链路
+</code></pre>
+<p>老周问：</p>
+<p>“一个静态图片，有必要每次都从北京传过去吗？”</p>
+<p>林默突然明白了。</p>
+<hr />
+<h2 id="cdn">七、CDN 出现</h2>
+<p>老周画：</p>
+<figure class="architecture"><div class="diagram-frame" tabindex="0" role="region" aria-label="让静态资源靠近读者，可横向滚动"><img alt="让静态资源靠近读者" src="diagrams/cdn-cache.svg" /></div><figcaption>让静态资源靠近读者<a href="diagrams/cdn-cache.svg" target="_blank" rel="noopener">查看大图 ↗</a></figcaption></figure>
+<details class="original-diagram">
+<summary>查看文字版示意</summary>
+<pre><code class="language-text">                 北京源站
+                    ↑
+                    │ 回源
+              ┌─────┴─────┐
+              │    CDN    │
+              └─────┬─────┘
+                    │
+      ┌─────────────┼─────────────┐
+      ▼             ▼             ▼
+   东京节点      洛杉矶节点      新加坡节点
+</code></pre>
+</details>
+<p>用户不再每次访问北京源站。</p>
+<p>美国用户：</p>
+<pre><code class="language-text">用户
+ ↓
+洛杉矶 CDN 节点
+</code></pre>
+<p>日本用户：</p>
+<pre><code class="language-text">用户
+ ↓
+东京 CDN 节点
+</code></pre>
+<p>新加坡用户：</p>
+<pre><code class="language-text">用户
+ ↓
+新加坡 CDN 节点
+</code></pre>
+<p>这就是：</p>
+<h3 id="cdn_1">CDN</h3>
+<p>Content Delivery Network。</p>
+<p>内容分发网络。</p>
+<hr />
+<h2 id="cdn_2">八、CDN 的本质是什么？</h2>
+<p>林默：</p>
+<p>“所以就是多放几台服务器？”</p>
+<p>老周：</p>
+<p>“可以这么理解，但关键在于——”</p>
+<blockquote>
+<p><strong>把内容放到离用户更近的地方。</strong></p>
+</blockquote>
+<p>这个思想其实和 Redis 很像。</p>
+<p>Redis：</p>
+<pre><code class="language-text">把数据库里的热点数据
+放到离应用更近的内存
+</code></pre>
+<p>CDN：</p>
+<pre><code class="language-text">把源站里的静态内容
+放到离用户更近的边缘节点
+</code></pre>
+<p>所以从本质上说：</p>
+<blockquote>
+<p><strong>CDN 是互联网边缘的大型缓存系统。</strong></p>
+</blockquote>
+<hr />
+<h2 id="cdn_3">九、第一次访问 CDN 会发生什么？</h2>
+<p>美国用户请求：</p>
+<pre><code class="language-text">/banner.jpg
+</code></pre>
+<p>洛杉矶 CDN 节点：</p>
+<pre><code class="language-text">本地没有
+</code></pre>
+<p>于是：</p>
+<pre><code class="language-text">CDN
+ ↓
+回源
+ ↓
+北京服务器
+ ↓
+获取 banner.jpg
+ ↓
+缓存到洛杉矶
+ ↓
+返回用户
+</code></pre>
+<p>这第一次可能还是慢。</p>
+<p>但第二个美国用户：</p>
+<pre><code class="language-text">用户
+ ↓
+洛杉矶 CDN
+ ↓
+直接命中
+</code></pre>
+<p>不用再回北京。</p>
+<p>这叫：</p>
+<h3 id="cache-hit">Cache Hit</h3>
+<p>缓存命中。</p>
+<p>如果没有：</p>
+<h3 id="cache-miss">Cache Miss</h3>
+<p>然后：</p>
+<h3 id="_4">回源</h3>
+<p>Origin Fetch。</p>
+<hr />
+<h2 id="cdn_4">十、为什么 CDN 能显著减少源站压力？</h2>
+<p>假设：</p>
+<pre><code class="language-text">banner.jpg
+大小 = 5 MB
+</code></pre>
+<p>一百万用户访问。</p>
+<p>没有 CDN：</p>
+<pre><code class="language-text">5 MB × 1,000,000
+</code></pre>
+<p>全部从源站发。</p>
+<p>大约：</p>
+<pre><code class="language-text">5 TB
+</code></pre>
+<p>流量。</p>
+<p>有 CDN：</p>
+<p>每个边缘节点可能只需要：</p>
+<pre><code class="language-text">回源一次
+</code></pre>
+<p>之后用户都从 CDN 读。</p>
+<p>源站的：</p>
+<pre><code class="language-text">带宽
+连接数
+CPU
+</code></pre>
+<p>压力大幅下降。</p>
+<p>所以 CDN 不只是：</p>
+<pre><code class="language-text">让用户更快
+</code></pre>
+<p>还可以：</p>
+<pre><code class="language-text">保护源站
+</code></pre>
+<hr />
+<h2 id="cdn_5">十一、静态资源为什么特别适合 CDN？</h2>
+<p>比如：</p>
+<pre><code class="language-text">logo.png
+style.css
+app.js
+视频
+安装包
+</code></pre>
+<p>特点：</p>
+<pre><code class="language-text">很多人读
+内容很少变化
+</code></pre>
+<p>和 Redis 缓存热点数据一个逻辑：</p>
+<blockquote>
+<p><strong>读多写少，非常适合缓存。</strong></p>
+</blockquote>
+<p>但动态 API：</p>
+<pre><code class="language-text">GET /api/account/balance
+</code></pre>
+<p>每个人结果不一样，而且实时变化。</p>
+<p>这种东西不能简单在 CDN 缓很久。</p>
+<p>所以典型架构：</p>
+<pre><code class="language-text">                ┌→ CDN → 图片/JS/CSS/视频
+用户 ───────────┤
+                └→ API Gateway → 动态业务
+</code></pre>
+<hr />
+<h2 id="_5">十二、前后端分离之后，这个结构尤其明显</h2>
+<p>前端打包出来：</p>
+<pre><code class="language-text">index.html
+app.js
+vendor.js
+style.css
+</code></pre>
+<p>通常可以部署到：</p>
+<pre><code class="language-text">CDN / Object Storage
+</code></pre>
+<p>后端：</p>
+<pre><code class="language-text">api.example.com
+</code></pre>
+<p>进入：</p>
+<pre><code class="language-text">Gateway
+↓
+App
+↓
+Redis/MySQL
+</code></pre>
+<p>于是：</p>
+<pre><code class="language-text">静态内容
+→ CDN
+
+动态业务
+→ 后端集群
+</code></pre>
+<p>两条路径彻底分开。</p>
+<hr />
+<h2 id="_6">十三、缓存多久？</h2>
+<p>林默给所有 CDN 文件设置：</p>
+<pre><code class="language-text">Cache-Control: max-age=31536000
+</code></pre>
+<p>一年。</p>
+<p>结果前端上线新版本。</p>
+<p>用户刷新：</p>
+<pre><code class="language-text">还是旧 app.js
+</code></pre>
+<p>林默：</p>
+<p>“完蛋。”</p>
+<p>缓存最麻烦的问题再次出现：</p>
+<blockquote>
+<p><strong>内容变了，但是缓存没变。</strong></p>
+</blockquote>
+<p>这和 Redis 一模一样。</p>
+<hr />
+<h2 id="cdn_6">十四、CDN 缓存一致性</h2>
+<p>比如：</p>
+<pre><code class="language-text">app.js
+</code></pre>
+<p>旧版本：</p>
+<pre><code class="language-text">v1
+</code></pre>
+<p>CDN 已经缓存。</p>
+<p>现在源站更新成：</p>
+<pre><code class="language-text">v2
+</code></pre>
+<p>但 CDN 不知道。</p>
+<p>在 TTL 到期前：</p>
+<pre><code class="language-text">用户仍然拿 v1
+</code></pre>
+<p>怎么办？</p>
+<p>一种办法：</p>
+<h3 id="cdn-purge">CDN Purge</h3>
+<p>主动刷新/失效缓存。</p>
+<p>告诉 CDN：</p>
+<pre><code class="language-text">/app.js
+</code></pre>
+<p>删掉。</p>
+<p>下一次用户访问：</p>
+<pre><code class="language-text">重新回源
+</code></pre>
+<p>获取 v2。</p>
+<hr />
+<h2 id="_7">十五、但是有一个更漂亮的办法：文件指纹</h2>
+<p>前端工程里常见：</p>
+<pre><code class="language-text">app.a81f2c.js
+</code></pre>
+<p>下一次发布：</p>
+<pre><code class="language-text">app.9c71ab.js
+</code></pre>
+<p>文件内容变化：</p>
+<pre><code class="language-text">文件名也变化
+</code></pre>
+<p>于是可以放心：</p>
+<pre><code class="language-text">Cache-Control: 1 year
+</code></pre>
+<p>因为新页面引用的是：</p>
+<pre><code class="language-text">app.9c71ab.js
+</code></pre>
+<p>这是一个全新的 URL。</p>
+<p>CDN：</p>
+<pre><code class="language-text">没有缓存
+↓
+回源
+↓
+拿新版本
+</code></pre>
+<p>旧用户如果还访问：</p>
+<pre><code class="language-text">app.a81f2c.js
+</code></pre>
+<p>继续拿旧版本也没关系。</p>
+<p>这叫：</p>
+<h3 id="cache-busting">Cache Busting</h3>
+<p>缓存破坏 / 缓存版本化。</p>
+<hr />
+<h2 id="_8">十六、这其实又是一个系统设计思想</h2>
+<p>不要总想着：</p>
+<pre><code class="language-text">“怎么让缓存实时更新？”
+</code></pre>
+<p>有时更简单的是：</p>
+<blockquote>
+<p><strong>让新内容使用一个新 Key。</strong></p>
+</blockquote>
+<p>Redis 中也可以类似：</p>
+<pre><code class="language-text">user:9527:v1
+user:9527:v2
+</code></pre>
+<p>CDN：</p>
+<pre><code class="language-text">app.hash1.js
+app.hash2.js
+</code></pre>
+<p>很多缓存一致性问题，可以通过：</p>
+<h3 id="immutable-resource">Immutable Resource</h3>
+<p>不可变资源</p>
+<p>来简化。</p>
+<hr />
+<h2 id="html">十七、HTML 为什么通常不能缓存一年？</h2>
+<p>因为：</p>
+<pre><code class="language-text">index.html
+</code></pre>
+<p>里面可能引用：</p>
+<pre><code class="language-html">&lt;script src=&quot;app.9c71ab.js&quot;&gt;&lt;/script&gt;
+</code></pre>
+<p>如果 index.html 自己缓存一年，</p>
+<p>用户一直拿旧 HTML：</p>
+<pre><code class="language-text">&lt;script src=&quot;app.a81f2c.js&quot;&gt;&lt;/script&gt;
+</code></pre>
+<p>那新 JS 文件再漂亮也没用。</p>
+<p>所以常见策略是：</p>
+<pre><code class="language-text">index.html
+→ 短缓存 / 不缓存
+
+带 hash 的 JS/CSS
+→ 长缓存
+</code></pre>
+<p>这是现代 Web 前端很重要的缓存设计。</p>
+<hr />
+<h2 id="etag">十八、ETag 又是什么？</h2>
+<p>林默问：</p>
+<p>“如果文件没变，但 TTL 到期了，是不是必须重新下载？”</p>
+<p>不一定。</p>
+<p>浏览器可以发送：</p>
+<pre><code class="language-http">If-None-Match: &quot;abc123&quot;
+</code></pre>
+<p>服务器检查：</p>
+<pre><code class="language-text">文件还是 abc123
+</code></pre>
+<p>返回：</p>
+<pre><code class="language-http">304 Not Modified
+</code></pre>
+<p>意思：</p>
+<blockquote>
+<p>“没变，你继续用本地的。”</p>
+</blockquote>
+<p>不用重新传整个文件。</p>
+<p><code>ETag</code> 可以理解成：</p>
+<pre><code class="language-text">文件版本指纹
+</code></pre>
+<p>类似还有：</p>
+<pre><code class="language-text">Last-Modified
+</code></pre>
+<p>客户端问：</p>
+<pre><code class="language-text">从上次修改以后变了吗？
+</code></pre>
+<p>服务器：</p>
+<pre><code class="language-text">没变
+→ 304
+</code></pre>
+<hr />
+<h2 id="cdn_7">十九、浏览器缓存和 CDN 缓存不是一回事</h2>
+<p>林默整理：</p>
+<pre><code class="language-text">Browser Cache
+</code></pre>
+<p>缓存发生在：</p>
+<pre><code class="language-text">用户自己的设备
+</code></pre>
+<p>而：</p>
+<pre><code class="language-text">CDN Cache
+</code></pre>
+<p>发生在：</p>
+<pre><code class="language-text">离用户较近的 CDN 边缘服务器
+</code></pre>
+<p>整体链路：</p>
+<pre><code class="language-text">浏览器
+ ↓
+浏览器缓存？
+ ↓ Miss
+CDN
+ ↓
+CDN 缓存？
+ ↓ Miss
+源站
+</code></pre>
+<p>因此实际 Web 系统可能有多层缓存：</p>
+<pre><code class="language-text">Browser Cache
+↓
+CDN Cache
+↓
+Nginx Cache
+↓
+Redis
+↓
+MySQL
+</code></pre>
+<p>这就是：</p>
+<h3 id="multi-level-cache">Multi-Level Cache</h3>
+<p>多级缓存。</p>
+<hr />
+<h2 id="_9">二十、多级缓存为什么快？</h2>
+<p>假设：</p>
+<pre><code class="language-text">浏览器缓存命中
+</code></pre>
+<p>甚至网络请求都不用发。</p>
+<p>最快。</p>
+<p>浏览器没有：</p>
+<pre><code class="language-text">CDN 命中
+</code></pre>
+<p>可能十几毫秒。</p>
+<p>CDN 没有：</p>
+<pre><code class="language-text">源站 Redis 命中
+</code></pre>
+<p>几十毫秒。</p>
+<p>再没有：</p>
+<pre><code class="language-text">MySQL
+</code></pre>
+<p>更慢。</p>
+<p>所以：</p>
+<pre><code class="language-text">越靠近用户
+↓
+越快
+</code></pre>
+<p>又回到了第二章那个规律：</p>
+<blockquote>
+<p><strong>热门数据应该尽量靠近使用它的人。</strong></p>
+</blockquote>
+<hr />
+<h2 id="cdn_8">二十一、但是 CDN 节点自己挂了怎么办？</h2>
+<p>比如洛杉矶节点故障。</p>
+<p>如果 DNS 还把用户：</p>
+<pre><code class="language-text">全部指向洛杉矶节点
+</code></pre>
+<p>那就麻烦了。</p>
+<p>所以成熟 CDN 会做：</p>
+<pre><code class="language-text">健康检查
+</code></pre>
+<p>如果节点异常：</p>
+<pre><code class="language-text">洛杉矶节点 ❌
+</code></pre>
+<p>流量可以调度到：</p>
+<pre><code class="language-text">旧金山节点
+</code></pre>
+<p>或者：</p>
+<pre><code class="language-text">西雅图节点
+</code></pre>
+<p>用户甚至可能感觉不到。</p>
+<p>这已经开始进入：</p>
+<h3 id="global-traffic-management">Global Traffic Management</h3>
+<p>全球流量调度。</p>
+<hr />
+<h2 id="_10">二十二、系统有多个机房之后会发生什么？</h2>
+<p>公司越来越大。</p>
+<p>部署：</p>
+<pre><code class="language-text">北京 Region
+上海 Region
+新加坡 Region
+美国 Region
+</code></pre>
+<p>现在用户：</p>
+<pre><code class="language-text">中国用户
+→ 中国 Region
+
+东南亚用户
+→ 新加坡 Region
+
+美国用户
+→ 美国 Region
+</code></pre>
+<p>这叫：</p>
+<h3 id="multi-region-deployment">Multi-Region Deployment</h3>
+<p>多地域部署。</p>
+<p>好处不仅是速度。</p>
+<p>还有：</p>
+<h3 id="_11">容灾</h3>
+<p>如果整个北京机房挂了：</p>
+<pre><code class="language-text">北京 Region ❌
+</code></pre>
+<p>可以把流量切到：</p>
+<pre><code class="language-text">上海 Region
+</code></pre>
+<p>系统仍然可以继续运行。</p>
+<hr />
+<h2 id="_12">二十三、可是数据库怎么办？</h2>
+<p>林默忽然发现事情又复杂了。</p>
+<p>App 放多个 Region 很容易。</p>
+<p>例如：</p>
+<pre><code class="language-text">Beijing App
+Singapore App
+US App
+</code></pre>
+<p>但所有地方都访问北京 MySQL：</p>
+<pre><code class="language-text">US App
+↓
+跨太平洋
+↓
+Beijing MySQL
+</code></pre>
+<p>还是慢。</p>
+<p>那是不是：</p>
+<pre><code class="language-text">每个 Region 都放 MySQL？
+</code></pre>
+<p>比如：</p>
+<pre><code class="language-text">Beijing DB
+Singapore DB
+US DB
+</code></pre>
+<p>老周：</p>
+<p>“可以。”</p>
+<p>林默：</p>
+<p>“那它们怎么保持一致？”</p>
+<p>老周笑了。</p>
+<p>熟悉的噩梦又回来了。</p>
+<hr />
+<h2 id="_13">二十四、多地域真正难的是数据</h2>
+<p>静态资源：</p>
+<pre><code class="language-text">复制到全世界
+</code></pre>
+<p>很简单。</p>
+<p>因为主要是读。</p>
+<p>但动态数据：</p>
+<pre><code class="language-text">余额
+订单
+库存
+聊天消息
+</code></pre>
+<p>可能不断修改。</p>
+<p>比如用户在美国修改昵称：</p>
+<pre><code class="language-text">US DB：新昵称
+</code></pre>
+<p>北京用户马上查询：</p>
+<pre><code class="language-text">Beijing DB
+</code></pre>
+<p>它什么时候能看到？</p>
+<p>这就再次回到：</p>
+<pre><code class="language-text">复制延迟
+一致性
+冲突
+</code></pre>
+<p>只不过现在延迟不再是：</p>
+<pre><code class="language-text">同一个机房几毫秒
+</code></pre>
+<p>而可能是：</p>
+<pre><code class="language-text">跨洲几十到几百毫秒
+</code></pre>
+<p>于是：</p>
+<blockquote>
+<p><strong>多地域系统设计，真正难的不是部署服务，而是数据一致性。</strong></p>
+</blockquote>
+<hr />
+<h2 id="active-passive">二十五、Active-Passive</h2>
+<p>一种相对简单的方案：</p>
+<pre><code class="language-text">北京 Region
+→ Active
+
+上海 Region
+→ Passive
+</code></pre>
+<p>平时所有业务：</p>
+<pre><code class="language-text">北京处理
+</code></pre>
+<p>上海：</p>
+<pre><code class="language-text">同步数据
+等待
+</code></pre>
+<p>北京整个挂掉：</p>
+<pre><code class="language-text">流量切上海
+</code></pre>
+<p>这叫：</p>
+<h3 id="active-passive_1">Active-Passive</h3>
+<p>主备模式。</p>
+<p>优点：</p>
+<pre><code class="language-text">架构相对简单
+数据冲突少
+</code></pre>
+<p>缺点：</p>
+<pre><code class="language-text">备用资源平时利用率低
+故障切换可能需要时间
+</code></pre>
+<hr />
+<h2 id="active-active">二十六、Active-Active</h2>
+<p>更进一步：</p>
+<pre><code class="language-text">北京 Region
+→ 接流量
+
+上海 Region
+→ 也接流量
+</code></pre>
+<p>这叫：</p>
+<h3 id="active-active_1">Active-Active</h3>
+<p>双活 / 多活。</p>
+<p>资源利用更充分。</p>
+<p>用户也能就近访问。</p>
+<p>但难度瞬间提高。</p>
+<p>比如：</p>
+<p>北京：</p>
+<pre><code class="language-text">用户把昵称改成 A
+</code></pre>
+<p>上海同时：</p>
+<pre><code class="language-text">用户把昵称改成 B
+</code></pre>
+<p>最后到底是什么？</p>
+<pre><code class="language-text">A？
+B？
+</code></pre>
+<p>需要：</p>
+<pre><code class="language-text">冲突解决
+</code></pre>
+<p>支付、库存更麻烦。</p>
+<p>所以：</p>
+<blockquote>
+<p><strong>多活不是“再部署一套服务器”这么简单。</strong></p>
+</blockquote>
+<p>核心难点是：</p>
+<pre><code class="language-text">写冲突
+一致性
+复制
+故障恢复
+</code></pre>
+<hr />
+<h2 id="rpo-rto">二十七、RPO 和 RTO</h2>
+<p>这时候老周第一次让林默记两个真正重要的指标。</p>
+<h3 id="rpo">RPO</h3>
+<p>Recovery Point Objective。</p>
+<p>问的是：</p>
+<blockquote>
+<p><strong>最多允许丢多少数据？</strong></p>
+</blockquote>
+<p>比如：</p>
+<pre><code class="language-text">RPO = 0
+</code></pre>
+<p>意味着：</p>
+<pre><code class="language-text">一条数据都不能丢
+</code></pre>
+<p>RPO：</p>
+<pre><code class="language-text">5 分钟
+</code></pre>
+<p>表示灾难发生时：</p>
+<pre><code class="language-text">最多接受丢最近 5 分钟的数据
+</code></pre>
+<hr />
+<h2 id="rto">二十八、RTO</h2>
+<p>Recovery Time Objective。</p>
+<p>问的是：</p>
+<blockquote>
+<p><strong>挂了以后，最多多久必须恢复？</strong></p>
+</blockquote>
+<p>比如：</p>
+<pre><code class="language-text">RTO = 30 秒
+</code></pre>
+<p>那么机房挂了：</p>
+<pre><code class="language-text">30 秒内
+</code></pre>
+<p>业务必须恢复。</p>
+<p>如果：</p>
+<pre><code class="language-text">RTO = 4 小时
+</code></pre>
+<p>那要求就低很多。</p>
+<p>所以：</p>
+<pre><code class="language-text">RPO
+→ 可以丢多少数据
+
+RTO
+→ 可以停多久
+</code></pre>
+<p>非常好记。</p>
+<hr />
+<h2 id="rpo0rto0">二十九、为什么 RPO=0、RTO=0 很贵？</h2>
+<p>老板：</p>
+<blockquote>
+<p>“我要求任何情况下不丢一条数据，而且 0 秒恢复。”</p>
+</blockquote>
+<p>架构师：</p>
+<blockquote>
+<p>“预算呢？”</p>
+</blockquote>
+<p>因为做到：</p>
+<pre><code class="language-text">RPO ≈ 0
+RTO ≈ 0
+</code></pre>
+<p>需要非常昂贵的：</p>
+<pre><code class="language-text">同步多副本
+多机房
+自动故障检测
+自动流量切换
+持续演练
+复杂数据库架构
+</code></pre>
+<p>所以高可用仍然不是：</p>
+<blockquote>
+<p>越高越好。</p>
+</blockquote>
+<p>而是：</p>
+<blockquote>
+<p><strong>根据业务价值决定花多少钱买可用性。</strong></p>
+</blockquote>
+<hr />
+<h2 id="999-9999">三十、99.9% 和 99.99% 到底差多少？</h2>
+<p>老周写：</p>
+<pre><code class="language-text">99.9%
+</code></pre>
+<p>一年允许不可用大约：</p>
+<pre><code class="language-text">8.76 小时
+</code></pre>
+<p>而：</p>
+<pre><code class="language-text">99.99%
+</code></pre>
+<p>一年大约：</p>
+<pre><code class="language-text">52.6 分钟
+</code></pre>
+<p>再到：</p>
+<pre><code class="language-text">99.999%
+</code></pre>
+<p>一年大约：</p>
+<pre><code class="language-text">5.26 分钟
+</code></pre>
+<p>每增加一个 <code>9</code>：</p>
+<pre><code class="language-text">系统复杂度
+和
+成本
+</code></pre>
+<p>通常都会显著上升。</p>
+<p>这就是：</p>
+<h3 id="availability">Availability</h3>
+<p>可用性。</p>
+<hr />
+<h2 id="200">三十一、可是“服务器返回 200”就算可用吗？</h2>
+<p>林默说：</p>
+<p>“只要服务没挂就是可用？”</p>
+<p>老周：</p>
+<p>“如果用户请求花 30 秒才返回呢？”</p>
+<p>“……”</p>
+<p>“如果首页打开了，但是支付全挂呢？”</p>
+<p>“……”</p>
+<p>所以真正的可用性不只是：</p>
+<pre><code class="language-text">进程还活着
+</code></pre>
+<p>而应该是：</p>
+<blockquote>
+<p><strong>用户能在可接受时间内完成关键业务。</strong></p>
+</blockquote>
+<p>这也是为什么监控不能只看：</p>
+<pre><code class="language-text">CPU
+Memory
+</code></pre>
+<p>还要看：</p>
+<pre><code class="language-text">成功率
+错误率
+P95/P99 延迟
+关键业务成功率
+</code></pre>
+<hr />
+<h2 id="_14">三十二、平均延迟会骗人</h2>
+<p>监控：</p>
+<pre><code class="language-text">平均延迟：100ms
+</code></pre>
+<p>林默：</p>
+<p>“很快啊。”</p>
+<p>老周：</p>
+<p>“看 P99。”</p>
+<pre><code class="language-text">P99：8 秒
+</code></pre>
+<p>意思是：</p>
+<pre><code class="language-text">99% 请求 ≤ 8 秒
+</code></pre>
+<p>更准确一点：</p>
+<blockquote>
+<p>排序后，99% 请求的延迟不超过这个值。</p>
+</blockquote>
+<p>虽然大部分用户很快，</p>
+<p>但最慢的那部分用户体验极差。</p>
+<p>所以大型系统特别关注：</p>
+<pre><code class="language-text">P95
+P99
+P99.9
+</code></pre>
+<p>而不仅仅：</p>
+<pre><code class="language-text">Average
+</code></pre>
+<p>因为平均值可能被大量快速请求“稀释”。</p>
+<hr />
+<h2 id="_15">三十三、长尾延迟</h2>
+<p>假设 100 个请求：</p>
+<pre><code class="language-text">99 个请求：50ms
+1 个请求：5s
+</code></pre>
+<p>平均：</p>
+<pre><code class="language-text">≈ 99.5ms
+</code></pre>
+<p>看起来：</p>
+<pre><code class="language-text">不到 100ms
+</code></pre>
+<p>非常漂亮。</p>
+<p>但那个用户真的等了：</p>
+<pre><code class="language-text">5 秒
+</code></pre>
+<p>这就是：</p>
+<h3 id="tail-latency">Tail Latency</h3>
+<p>长尾延迟。</p>
+<p>系统越复杂，调用链越长：</p>
+<pre><code class="language-text">A
+↓
+B
+↓
+C
+↓
+D
+↓
+E
+</code></pre>
+<p>只要某一个下游偶尔慢一下，</p>
+<p>整个请求就可能进入长尾。</p>
+<p>所以：</p>
+<blockquote>
+<p><strong>系统设计不仅要优化平均情况，还要优化最坏的那部分用户。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_16">三十四、现在整个请求终于可以完整走一遍了</h2>
+<p>一个美国用户打开商城。</p>
+<p>第一步：</p>
+<pre><code class="language-text">www.example.com
+</code></pre>
+<p>DNS：</p>
+<pre><code class="language-text">找到离用户更合适的入口
+</code></pre>
+<p>然后：</p>
+<pre><code class="language-text">HTML / JS / CSS / 图片
+↓
+CDN
+</code></pre>
+<p>大部分静态资源直接从附近边缘节点返回。</p>
+<p>动态请求：</p>
+<pre><code class="language-text">/api/orders
+</code></pre>
+<p>进入：</p>
+<pre><code class="language-text">最近 Region
+↓
+Gateway
+↓
+Rate Limiter
+↓
+App
+↓
+Redis
+↓
+DB / MQ
+</code></pre>
+<p>如果某个 Region 故障：</p>
+<pre><code class="language-text">DNS / Global LB
+↓
+切换其他 Region
+</code></pre>
+<p>到这里，我们最开始那台：</p>
+<pre><code class="language-text">Spring Boot + MySQL
+</code></pre>
+<p>已经彻底长成了一个分布式系统。</p>
+<hr />
+<h2 id="_17">三十五、从第一章到现在，其实一直只有几个问题</h2>
+<p>林默把前六章和这一章全部画在一起。</p>
+<h3 id="_18">用户越来越多</h3>
+<pre><code class="language-text">一台 App 不够
+↓
+负载均衡
+↓
+水平扩展
+</code></pre>
+<h3 id="_19">状态无法共享</h3>
+<pre><code class="language-text">Session
+↓
+Redis
+↓
+无状态服务
+</code></pre>
+<h3 id="_20">数据库读压力</h3>
+<pre><code class="language-text">主从
+↓
+读写分离
+</code></pre>
+<h3 id="_21">数据库容量和写能力</h3>
+<pre><code class="language-text">分库分表
+</code></pre>
+<h3 id="_22">瞬时流量</h3>
+<pre><code class="language-text">MQ
+↓
+削峰
+</code></pre>
+<h3 id="_23">系统过载</h3>
+<pre><code class="language-text">限流
+</code></pre>
+<h3 id="_24">下游故障</h3>
+<pre><code class="language-text">超时
+熔断
+降级
+隔离
+</code></pre>
+<h3 id="_25">用户离服务器太远</h3>
+<pre><code class="language-text">CDN
+多地域部署
+</code></pre>
+<p>老周说：</p>
+<blockquote>
+<p>“你看起来学了几十个技术名词。”</p>
+<p>“其实一直在解决几个非常朴素的问题。”</p>
+</blockquote>
+<hr />
+<h2 id="_26">三十六、系统设计真正的六个问题</h2>
+<p>林默最后总结成：</p>
+<pre><code class="language-text">1. 请求太多怎么办？
+2. 数据太多怎么办？
+3. 某台机器挂了怎么办？
+4. 某个服务变慢怎么办？
+5. 数据不一致怎么办？
+6. 用户离服务器太远怎么办？
+</code></pre>
+<p>几乎所有常见系统设计技术，</p>
+<p>都可以塞回这六个问题。</p>
+<p>例如：</p>
+<pre><code class="language-text">Load Balancer
+→ 请求太多
+</code></pre>
+<pre><code class="language-text">Sharding
+→ 数据太多
+</code></pre>
+<pre><code class="language-text">Replica
+→ 机器挂了
+</code></pre>
+<pre><code class="language-text">Circuit Breaker
+→ 服务变慢/失败
+</code></pre>
+<pre><code class="language-text">Outbox / Consensus
+→ 数据一致性
+</code></pre>
+<pre><code class="language-text">CDN / Multi-Region
+→ 用户太远
+</code></pre>
+<p>到这里，你已经不应该再把系统设计看成：</p>
+<blockquote>
+<p>“背一堆组件。”</p>
+</blockquote>
+<p>而应该开始看成：</p>
+<blockquote>
+<p><strong>发现瓶颈 → 找出约束 → 做取舍 → 引入新组件 → 接受它带来的新问题。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_27">第七章结束</h2>
+<p>这一章需要真正记住的因果链是：</p>
+<pre><code class="language-text">服务器本身没问题
+↓
+用户仍然慢
+↓
+发现网络距离也是成本
+↓
+DNS
+↓
+就近流量调度
+↓
+静态资源仍然跨地域传输
+↓
+CDN
+↓
+边缘缓存
+↓
+Cache Hit / Miss / 回源
+↓
+缓存一致性
+↓
+Cache-Control / ETag / 文件 Hash
+↓
+多地域部署
+↓
+Region 故障转移
+↓
+Active-Passive / Active-Active
+↓
+RPO / RTO
+↓
+可用性
+↓
+P95 / P99 / 长尾延迟
+</code></pre>
+<p>下一章，我们可以正式进入系统设计里最容易把人绕晕、但也是最核心的一块：</p>
+<h3 id="cap">下一章：两个数据库都说自己是真的——CAP、一致性与分布式共识</h3>
+<p>会从一次真正的<strong>网络分区事故</strong>开始，一步步讲：</p>
+<p><strong>强一致性、最终一致性、CAP 到底在说什么、为什么网络分区无法避免、CP/AP 怎么选、Quorum、Leader、Raft 的基本直觉、脑裂、分布式锁为什么会失效，以及为什么“多副本”远没有想象中简单。</strong></p>
+<blockquote>
+<p><strong>工程补充</strong>：DNS 缓存、健康检查周期和客户端连接会影响实际切换时间。CDN 故障转移与多地域容灾都需要预留容量，并验证数据恢复点（RPO）和恢复时间（RTO）。</p>
+</blockquote></article><nav class="chapter-nav" aria-label="章节切换"><a href="chapter-06.html" rel="prev">← 上一章</a><a href="chapter-08.html" rel="next">下一章 →</a></nav></main></div><footer>系统设计：从一台服务器开始<br><small>现有 8 章 · 连载中 · 第九章待续</small><p><a href="editorial.html">整理说明与技术参考</a> · <a href="https://github.com/wupzl/system-design-reader">项目源码 ↗</a></p></footer></body></html>

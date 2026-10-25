@@ -1,0 +1,1393 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="description" content="系统设计：从一台服务器开始。跟随林默与老周，在八章故事中理解缓存、数据库、消息队列与分布式共识。连载中，第九章待续。"><title>门外已经挤了两百万人——限流、熔断、降级与服务雪崩 · 系统设计</title><script>try{document.documentElement.dataset.theme=localStorage.getItem('reader-theme')||'white';document.documentElement.style.setProperty('--reading-size',Math.max(16,Math.min(26,Number(localStorage.getItem('reader-size'))||18))+'px')}catch(e){}</script><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="shelf-nav.css"><link rel="stylesheet" href="reader.css"><script src="app.js" defer></script></head>
+<body class="reading"><a class="skip" href="#main">跳到正文</a><header><a class="brand" href="index.html">系统设计<span>SYSTEM DESIGN</span></a><nav class="shelf-nav" aria-label="学习项目导航"><a class="shelf-home" href="/">← 学习书架</a><details class="shelf-switch"><summary>切换项目 ▾</summary><div class="shelf-menu"><a href="/pytorch-apprentice/">PyTorch：炼金术士的学徒</a><a href="/ai-era-reader/">AI 纪元</a><a href="/data-empire-reader/">数据帝国</a><a href="/rag-empire-reader/">RAG 帝国</a><a href="/system-design-reader/" aria-current="page">系统设计</a></div></details></nav><div class="controls"><button id="smaller" aria-label="缩小字号" type="button">A−</button><button id="larger" aria-label="增大字号" type="button">A＋</button><button id="theme" aria-label="切换阅读背景" type="button">纯白</button></div></header>
+<div class="reader-layout"><aside><a href="index.html">← 全书目录</a><p class="eyebrow">本章导航</p><div class="toc">
+<ul>
+<li><a href="#_1">一、第一道城门：不是所有请求都应该进入系统</a></li>
+<li><a href="#_2">二、限流到底在限制什么？</a></li>
+<li><a href="#_3">三、为什么拒绝反而更好？</a></li>
+<li><a href="#_4">四、第一个限流算法：固定窗口</a></li>
+<li><a href="#_5">五、固定窗口的边界问题</a></li>
+<li><a href="#_6">六、滑动窗口</a></li>
+<li><a href="#_7">七、漏桶：无论外面多疯狂，我都匀速放行</a></li>
+<li><a href="#_8">八、但漏桶有个问题</a></li>
+<li><a href="#_9">九、令牌桶</a></li>
+<li><a href="#_10">十、四种限流算法终于不用死背</a></li>
+<li><a href="#_11">十一、到底对谁限流？</a></li>
+<li><a href="#_12">十二、越贵的操作，限流应该越早</a></li>
+<li><a href="#_13">十三、限流解决了入口，系统内部又炸了</a></li>
+<li><a href="#_14">十四、一个小服务为什么能拖死整个系统？</a></li>
+<li><a href="#_16">十五、注意：这和缓存雪崩不是一回事</a></li>
+<li><a href="#_17">十六、罪魁祸首之一：没有超时</a></li>
+<li><a href="#_18">十七、但是超时后重试，不就行了吗？</a></li>
+<li><a href="#_19">十八、重试不是不能用，而是不能无脑用</a></li>
+<li><a href="#jitter_1">十九、为什么需要 Jitter？</a></li>
+<li><a href="#_20">二十、但是如果短信服务已经彻底挂了呢？</a></li>
+<li><a href="#_21">二十一、电路为什么需要保险丝？</a></li>
+<li><a href="#_22">二十二、熔断器的三个状态</a></li>
+<li><a href="#_23">二十三、熔断保护的是谁？</a></li>
+<li><a href="#_24">二十四、熔断以后，用户怎么办？</a></li>
+<li><a href="#_26">二十五、什么叫核心功能？</a></li>
+<li><a href="#_28">二十六、降级和熔断有什么区别？</a></li>
+<li><a href="#fallback">二十七、Fallback</a></li>
+<li><a href="#_31">二十八、然后又出现一个问题：线程池共享</a></li>
+<li><a href="#_32">二十九、隔离：别让一个坏邻居占光资源</a></li>
+<li><a href="#_33">三十、为什么叫舱壁？</a></li>
+<li><a href="#_34">三十一、这句话非常重要：故障不可避免，但可以隔离</a></li>
+<li><a href="#_36">三十二、入口保护的完整链路</a></li>
+<li><a href="#_37">三十三、一次真正的事故演练</a></li>
+<li><a href="#_38">三十四、怎么阻止这条链路？</a></li>
+<li><a href="#_45">三十五、限流、熔断、降级、隔离终于串起来了</a></li>
+<li><a href="#_46">三十六、系统设计开始出现一个更深的原则</a></li>
+<li><a href="#_47">第六章结束</a></li>
+</ul>
+</div>
+</aside><main id="main"><div class="chapter-heading"><p class="eyebrow">CHAPTER 06 / 08 · 连载中</p><h1>门外已经挤了两百万人——限流、熔断、降级与服务雪崩</h1><p>限流算法 · 熔断降级 · 故障隔离</p></div><details class="mobile-toc"><summary>展开本章目录</summary><div class="toc">
+<ul>
+<li><a href="#_1">一、第一道城门：不是所有请求都应该进入系统</a></li>
+<li><a href="#_2">二、限流到底在限制什么？</a></li>
+<li><a href="#_3">三、为什么拒绝反而更好？</a></li>
+<li><a href="#_4">四、第一个限流算法：固定窗口</a></li>
+<li><a href="#_5">五、固定窗口的边界问题</a></li>
+<li><a href="#_6">六、滑动窗口</a></li>
+<li><a href="#_7">七、漏桶：无论外面多疯狂，我都匀速放行</a></li>
+<li><a href="#_8">八、但漏桶有个问题</a></li>
+<li><a href="#_9">九、令牌桶</a></li>
+<li><a href="#_10">十、四种限流算法终于不用死背</a></li>
+<li><a href="#_11">十一、到底对谁限流？</a></li>
+<li><a href="#_12">十二、越贵的操作，限流应该越早</a></li>
+<li><a href="#_13">十三、限流解决了入口，系统内部又炸了</a></li>
+<li><a href="#_14">十四、一个小服务为什么能拖死整个系统？</a></li>
+<li><a href="#_16">十五、注意：这和缓存雪崩不是一回事</a></li>
+<li><a href="#_17">十六、罪魁祸首之一：没有超时</a></li>
+<li><a href="#_18">十七、但是超时后重试，不就行了吗？</a></li>
+<li><a href="#_19">十八、重试不是不能用，而是不能无脑用</a></li>
+<li><a href="#jitter_1">十九、为什么需要 Jitter？</a></li>
+<li><a href="#_20">二十、但是如果短信服务已经彻底挂了呢？</a></li>
+<li><a href="#_21">二十一、电路为什么需要保险丝？</a></li>
+<li><a href="#_22">二十二、熔断器的三个状态</a></li>
+<li><a href="#_23">二十三、熔断保护的是谁？</a></li>
+<li><a href="#_24">二十四、熔断以后，用户怎么办？</a></li>
+<li><a href="#_26">二十五、什么叫核心功能？</a></li>
+<li><a href="#_28">二十六、降级和熔断有什么区别？</a></li>
+<li><a href="#fallback">二十七、Fallback</a></li>
+<li><a href="#_31">二十八、然后又出现一个问题：线程池共享</a></li>
+<li><a href="#_32">二十九、隔离：别让一个坏邻居占光资源</a></li>
+<li><a href="#_33">三十、为什么叫舱壁？</a></li>
+<li><a href="#_34">三十一、这句话非常重要：故障不可避免，但可以隔离</a></li>
+<li><a href="#_36">三十二、入口保护的完整链路</a></li>
+<li><a href="#_37">三十三、一次真正的事故演练</a></li>
+<li><a href="#_38">三十四、怎么阻止这条链路？</a></li>
+<li><a href="#_45">三十五、限流、熔断、降级、隔离终于串起来了</a></li>
+<li><a href="#_46">三十六、系统设计开始出现一个更深的原则</a></li>
+<li><a href="#_47">第六章结束</a></li>
+</ul>
+</div>
+</details><article><p>秒杀系统上线之后，林默觉得自己已经把洪峰挡住了。</p>
+<p>现在请求链路大概是：</p>
+<pre><code class="language-text">用户
+ ↓
+Load Balancer
+ ↓
+App
+ ↓
+Redis
+ ↓
+MQ
+ ↓
+Consumer
+ ↓
+MySQL
+</code></pre>
+<p>秒杀流量先经过 Redis。</p>
+<p>抢到资格的请求才进入 MQ。</p>
+<p>数据库终于不会被二百万人直接冲垮。</p>
+<p>林默满意地看着监控：</p>
+<pre><code class="language-text">Redis：正常
+MQ：正常
+MySQL：正常
+</code></pre>
+<p>然后老周突然问：</p>
+<blockquote>
+<p>“Redis 能扛二百万请求，那你的 App 能吗？”</p>
+</blockquote>
+<p>林默愣了一下。</p>
+<p>是啊。</p>
+<p>请求到 Redis 之前，首先得经过：</p>
+<pre><code class="language-text">Nginx
+↓
+Spring Boot
+↓
+线程
+↓
+连接
+↓
+业务代码
+</code></pre>
+<p>也就是说，即使最终只有一万个请求进数据库——</p>
+<p>前面的应用服务器还是要接住：</p>
+<pre><code class="language-text">200 万个请求
+</code></pre>
+<p>老周说：</p>
+<blockquote>
+<p>“数据库不死，不代表系统不死。”</p>
+</blockquote>
+<hr />
+<h2 id="_1">一、第一道城门：不是所有请求都应该进入系统</h2>
+<p>晚上八点整。</p>
+<p>秒杀开始。</p>
+<pre><code class="language-text">2,000,000 用户
+↓
+同时点击
+</code></pre>
+<p>应用服务器瞬间：</p>
+<pre><code class="language-text">连接数：暴涨
+CPU：95%
+线程池：满
+GC：频繁
+</code></pre>
+<p>大量请求甚至还没访问 Redis，App 就已经开始变慢。</p>
+<p>林默问：</p>
+<p>“那继续加 App？”</p>
+<p>老周摇头。</p>
+<p>“你只有一万件商品。”</p>
+<p>“这二百万个请求，真的都值得进入核心系统吗？”</p>
+<p>林默突然意识到：</p>
+<pre><code class="language-text">库存：10000
+
+请求：2000000
+</code></pre>
+<p>99% 以上的人最终必然失败。</p>
+<p>如果所有请求都完整执行：</p>
+<pre><code class="language-text">鉴权
+↓
+查询活动
+↓
+查询商品
+↓
+查 Redis
+↓
+业务判断
+</code></pre>
+<p>本身就是浪费资源。</p>
+<p>于是老周在系统最前面画了一扇门：</p>
+<pre><code class="language-text">用户
+ ↓
+限流器
+ ↓
+系统
+</code></pre>
+<h3 id="rate-limiting">Rate Limiting</h3>
+<p>限流。</p>
+<hr />
+<h2 id="_2">二、限流到底在限制什么？</h2>
+<p>假设系统安全承受：</p>
+<pre><code class="language-text">10,000 QPS
+</code></pre>
+<p>现在来了：</p>
+<pre><code class="language-text">100,000 QPS
+</code></pre>
+<p>如果全部放进去：</p>
+<pre><code class="language-text">100000
+  ↓
+系统
+  ↓
+崩溃
+</code></pre>
+<p>结果是：</p>
+<pre><code class="language-text">10万人全部失败
+</code></pre>
+<p>但如果限流：</p>
+<pre><code class="language-text">100000
+   ↓
+限流器
+   ↓
+放 10000
+拒绝 90000
+</code></pre>
+<p>那么至少：</p>
+<pre><code class="language-text">10000 请求正常工作
+</code></pre>
+<p>所以限流的核心思想很反直觉：</p>
+<blockquote>
+<p><strong>为了让系统活下来，要主动拒绝一部分请求。</strong></p>
+</blockquote>
+<p>老周说：</p>
+<blockquote>
+<p>“成熟的系统，不是永远不拒绝请求。”</p>
+<p>“而是知道什么时候必须拒绝。”</p>
+</blockquote>
+<hr />
+<h2 id="_3">三、为什么拒绝反而更好？</h2>
+<p>林默一开始还是有点接受不了。</p>
+<p>“用户请求来了，我怎么能拒绝？”</p>
+<p>老周问：</p>
+<p>“如果你不拒绝，会发生什么？”</p>
+<p>假设正常接口：</p>
+<pre><code class="language-text">响应时间：50ms
+</code></pre>
+<p>超载之后：</p>
+<pre><code class="language-text">50ms
+↓
+300ms
+↓
+2s
+↓
+10s
+</code></pre>
+<p>线程越来越多。</p>
+<p>连接池越来越满。</p>
+<p>最终：</p>
+<pre><code class="language-text">所有请求 timeout
+</code></pre>
+<p>于是：</p>
+<pre><code class="language-text">不拒绝
+=
+最后所有人都用不了
+</code></pre>
+<p>而限流：</p>
+<pre><code class="language-text">一部分用户 → 正常服务
+另一部分用户 → 快速失败
+</code></pre>
+<p>例如直接返回：</p>
+<pre><code class="language-http">429 Too Many Requests
+</code></pre>
+<p>用户至少马上知道：</p>
+<pre><code class="language-text">“系统繁忙，请稍后再试。”
+</code></pre>
+<p>而不是：</p>
+<pre><code class="language-text">转圈 30 秒
+↓
+timeout
+</code></pre>
+<hr />
+<h2 id="_4">四、第一个限流算法：固定窗口</h2>
+<p>老周在白板画：</p>
+<pre><code class="language-text">12:00:00 ~ 12:00:01
+最多 100 个请求
+
+12:00:01 ~ 12:00:02
+最多 100 个请求
+</code></pre>
+<p>这叫：</p>
+<h3 id="fixed-window">Fixed Window</h3>
+<p>固定窗口。</p>
+<p>实现非常简单。</p>
+<p>Redis 里：</p>
+<pre><code class="language-text">rate:user:9527:12:00:00 = 37
+</code></pre>
+<p>每来一个请求：</p>
+<pre><code class="language-text">INCR
+</code></pre>
+<p>超过：</p>
+<pre><code class="language-text">100
+</code></pre>
+<p>拒绝。</p>
+<p>窗口结束：</p>
+<pre><code class="language-text">计数重新开始
+</code></pre>
+<p>林默：</p>
+<p>“这不是挺好吗？”</p>
+<p>老周：</p>
+<p>“边界。”</p>
+<hr />
+<h2 id="_5">五、固定窗口的边界问题</h2>
+<p>假设限制：</p>
+<pre><code class="language-text">每秒 100 请求
+</code></pre>
+<p>第一秒最后 100ms：</p>
+<pre><code class="language-text">00.900 ~ 01.000
+来了 100 个
+</code></pre>
+<p>下一秒最前 100ms：</p>
+<pre><code class="language-text">01.000 ~ 01.100
+又来了 100 个
+</code></pre>
+<p>两个窗口都没超过：</p>
+<pre><code class="language-text">100
+</code></pre>
+<p>但实际上在：</p>
+<pre><code class="language-text">200ms
+</code></pre>
+<p>内来了：</p>
+<pre><code class="language-text">200 请求
+</code></pre>
+<p>瞬时流量：</p>
+<pre><code class="language-text">1000 QPS
+</code></pre>
+<p>虽然规则写着：</p>
+<pre><code class="language-text">100 QPS
+</code></pre>
+<p>林默：</p>
+<p>“因为窗口边缘被钻空子了。”</p>
+<p>对。</p>
+<p>这就是固定窗口的问题。</p>
+<hr />
+<h2 id="_6">六、滑动窗口</h2>
+<p>于是老周把窗口变成：</p>
+<pre><code class="language-text">永远统计过去 1 秒
+</code></pre>
+<p>当前时间：</p>
+<pre><code class="language-text">12:00:01.500
+</code></pre>
+<p>统计范围：</p>
+<pre><code class="language-text">12:00:00.500
+~
+12:00:01.500
+</code></pre>
+<p>下一刻：</p>
+<pre><code class="language-text">12:00:01.600
+</code></pre>
+<p>统计范围也跟着移动：</p>
+<pre><code class="language-text">12:00:00.600
+~
+12:00:01.600
+</code></pre>
+<p>这就是：</p>
+<h3 id="sliding-window">Sliding Window</h3>
+<p>滑动窗口。</p>
+<p>它比固定窗口更加平滑。</p>
+<p>但代价也来了：</p>
+<pre><code class="language-text">需要记录更多时间信息
+实现更复杂
+空间成本更高
+</code></pre>
+<p>又一次：</p>
+<blockquote>
+<p>精确性提高，复杂度也提高。</p>
+</blockquote>
+<hr />
+<h2 id="_7">七、漏桶：无论外面多疯狂，我都匀速放行</h2>
+<p>老周拿起一个水桶。</p>
+<p>上面不断倒水：</p>
+<pre><code class="language-text">↓↓↓↓↓↓↓↓↓↓
+┌─────────┐
+│  水桶   │
+└────┬────┘
+     ↓
+   固定速度
+</code></pre>
+<p>这就是：</p>
+<h3 id="leaky-bucket">Leaky Bucket</h3>
+<p>漏桶算法。</p>
+<p>请求进入桶。</p>
+<p>桶底以固定速度处理：</p>
+<pre><code class="language-text">100 req/s
+</code></pre>
+<p>外面即使突然：</p>
+<pre><code class="language-text">10000 req/s
+</code></pre>
+<p>下游看到的仍然：</p>
+<pre><code class="language-text">100 req/s
+</code></pre>
+<p>如果桶满了：</p>
+<pre><code class="language-text">新请求丢弃
+</code></pre>
+<p>非常适合：</p>
+<blockquote>
+<p><strong>把不稳定流量整形成稳定流量。</strong></p>
+</blockquote>
+<p>林默说：</p>
+<p>“有点像 MQ。”</p>
+<p>“对。”</p>
+<p>漏桶和 MQ 的直觉很像：</p>
+<pre><code class="language-text">先排队
+↓
+稳定输出
+</code></pre>
+<hr />
+<h2 id="_8">八、但漏桶有个问题</h2>
+<p>假设系统空闲了十分钟。</p>
+<p>突然来：</p>
+<pre><code class="language-text">500 个请求
+</code></pre>
+<p>而系统其实完全有能力瞬间处理。</p>
+<p>漏桶仍然：</p>
+<pre><code class="language-text">100/s
+</code></pre>
+<p>慢慢放。</p>
+<p>也就是说：</p>
+<blockquote>
+<p>它对突发流量过于严格。</p>
+</blockquote>
+<p>于是另一个算法出现：</p>
+<h3 id="token-bucket">Token Bucket</h3>
+<p>令牌桶。</p>
+<hr />
+<h2 id="_9">九、令牌桶</h2>
+<p>想象系统里有一个桶。</p>
+<p>不是放请求。</p>
+<p>而是放：</p>
+<pre><code class="language-text">令牌
+</code></pre>
+<p>系统按照固定速度产生：</p>
+<pre><code class="language-text">每秒 100 个 Token
+</code></pre>
+<p>桶最多存：</p>
+<pre><code class="language-text">500 个
+</code></pre>
+<p>请求来了：</p>
+<pre><code class="language-text">有 Token
+→ 拿一个
+→ 放行
+</code></pre>
+<p>没有 Token：</p>
+<pre><code class="language-text">拒绝 / 等待
+</code></pre>
+<p>如果系统之前很闲：</p>
+<pre><code class="language-text">桶里攒了 500 Token
+</code></pre>
+<p>突然来了：</p>
+<pre><code class="language-text">500 个请求
+</code></pre>
+<p>可以瞬间全部通过。</p>
+<p>然后重新回到：</p>
+<pre><code class="language-text">100/s
+</code></pre>
+<p>所以令牌桶既能限制：</p>
+<pre><code class="language-text">长期平均速率
+</code></pre>
+<p>又允许：</p>
+<pre><code class="language-text">一定程度的瞬时突发
+</code></pre>
+<p>这就是它特别常见的原因。</p>
+<hr />
+<h2 id="_10">十、四种限流算法终于不用死背</h2>
+<p>林默写下：</p>
+<pre><code class="language-text">固定窗口
+→ 最简单
+→ 有窗口边界问题
+
+滑动窗口
+→ 更精确
+→ 成本更高
+
+漏桶
+→ 强制稳定输出
+→ 不喜欢突发
+
+令牌桶
+→ 控制平均速率
+→ 允许一定突发
+</code></pre>
+<p>如果面试官问：</p>
+<blockquote>
+<p>“为什么令牌桶比漏桶更适合很多 API 限流？”</p>
+</blockquote>
+<p>可以回答：</p>
+<blockquote>
+<p><strong>因为令牌桶限制长期平均速率的同时允许消耗预先积累的令牌处理短时突发流量，而漏桶更强调固定速率输出，流量整形更严格。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_11">十一、到底对谁限流？</h2>
+<p>林默原本以为：</p>
+<pre><code class="language-text">全系统 10000 QPS
+</code></pre>
+<p>就完了。</p>
+<p>老周问：</p>
+<p>“如果一个用户自己打 10000 QPS 呢？”</p>
+<p>于是限流可以有很多维度。</p>
+<p>按：</p>
+<pre><code class="language-text">用户
+IP
+接口
+租户
+API Key
+设备
+业务类型
+</code></pre>
+<p>例如：</p>
+<pre><code class="language-text">登录接口：
+同一 IP 每分钟 30 次
+
+普通 API：
+单用户 100 QPS
+
+支付接口：
+更严格
+
+整个系统：
+最大 50000 QPS
+</code></pre>
+<p>这叫：</p>
+<blockquote>
+<p><strong>分层限流。</strong></p>
+</blockquote>
+<p>因为不同资源的成本不同。</p>
+<hr />
+<h2 id="_12">十二、越贵的操作，限流应该越早</h2>
+<p>比如请求流程：</p>
+<pre><code class="language-text">请求
+↓
+JWT 校验
+↓
+数据库查询
+↓
+大模型调用
+↓
+第三方支付
+</code></pre>
+<p>假设一次大模型调用：</p>
+<pre><code class="language-text">成本 0.1 元
+</code></pre>
+<p>一个攻击者打：</p>
+<pre><code class="language-text">10000 次
+</code></pre>
+<p>如果你在大模型调用之后才判断限流——</p>
+<p>已经晚了。</p>
+<p>所以又出现那条原则：</p>
+<blockquote>
+<p><strong>便宜的拒绝，要尽量放在昂贵操作之前。</strong></p>
+</blockquote>
+<p>例如：</p>
+<pre><code class="language-text">CDN
+↓
+WAF
+↓
+Gateway 限流
+↓
+应用
+↓
+缓存
+↓
+数据库
+↓
+外部服务
+</code></pre>
+<p>越往后越贵。</p>
+<hr />
+<h2 id="_13">十三、限流解决了入口，系统内部又炸了</h2>
+<p>几周后。</p>
+<p>秒杀已经稳定。</p>
+<p>但一天上午，短信服务出现故障。</p>
+<p>正常链路：</p>
+<pre><code class="language-text">订单服务
+ ↓
+用户服务
+ ↓
+优惠券服务
+ ↓
+支付服务
+ ↓
+短信服务
+</code></pre>
+<p>短信服务平时：</p>
+<pre><code class="language-text">20ms
+</code></pre>
+<p>今天突然：</p>
+<pre><code class="language-text">10 秒
+</code></pre>
+<p>订单服务每发一次请求：</p>
+<pre><code class="language-text">等待...
+等待...
+等待...
+</code></pre>
+<p>线程越来越多。</p>
+<hr />
+<h2 id="_14">十四、一个小服务为什么能拖死整个系统？</h2>
+<p>假设订单服务线程池：</p>
+<pre><code class="language-text">200 threads
+</code></pre>
+<p>每个短信请求正常：</p>
+<pre><code class="language-text">20ms
+</code></pre>
+<p>理论上处理很快。</p>
+<p>但短信服务变成：</p>
+<pre><code class="language-text">10s
+</code></pre>
+<p>于是一个请求占一个线程：</p>
+<pre><code class="language-text">10 秒
+</code></pre>
+<p>很快：</p>
+<pre><code class="language-text">200 个线程全部卡住
+</code></pre>
+<p>新的订单请求：</p>
+<pre><code class="language-text">进不来
+</code></pre>
+<p>于是订单服务也开始 timeout。</p>
+<p>调用订单服务的上游：</p>
+<pre><code class="language-text">也开始等待
+</code></pre>
+<p>于是故障像多米诺骨牌：</p>
+<pre><code class="language-text">短信服务挂
+   ↓
+订单服务卡
+   ↓
+商城服务卡
+   ↓
+网关线程堆积
+   ↓
+整个系统挂
+</code></pre>
+<p>这叫：</p>
+<h3 id="_15">服务雪崩</h3>
+<p>Cascading Failure。</p>
+<hr />
+<h2 id="_16">十五、注意：这和缓存雪崩不是一回事</h2>
+<p>之前学过：</p>
+<pre><code class="language-text">缓存雪崩
+=
+大量缓存同时失效
+↓
+请求打数据库
+</code></pre>
+<p>这里的：</p>
+<pre><code class="language-text">服务雪崩
+=
+一个下游故障
+↓
+故障沿调用链扩散
+↓
+拖死大量服务
+</code></pre>
+<p>都叫“雪崩”，但场景不同。</p>
+<p>共同点是：</p>
+<blockquote>
+<p><strong>局部故障扩散成全局故障。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_17">十六、罪魁祸首之一：没有超时</h2>
+<p>林默看代码：</p>
+<pre><code class="language-java">httpClient.callSmsService();
+</code></pre>
+<p>默认超时：</p>
+<pre><code class="language-text">30 秒
+</code></pre>
+<p>老周问：</p>
+<p>“用户愿意为一条短信等 30 秒？”</p>
+<p>显然不愿意。</p>
+<p>于是第一道保护：</p>
+<h3 id="timeout">Timeout</h3>
+<p>超时。</p>
+<p>比如：</p>
+<pre><code class="language-text">短信服务：
+
+300ms 没返回
+↓
+直接认为失败
+</code></pre>
+<p>不要无限等待。</p>
+<p>因为：</p>
+<blockquote>
+<p><strong>等待本身就在占资源。</strong></p>
+</blockquote>
+<p>线程、连接、内存，全都在消耗。</p>
+<hr />
+<h2 id="_18">十七、但是超时后重试，不就行了吗？</h2>
+<p>林默：</p>
+<p>“那失败了我重试三次。”</p>
+<p>老周马上说：</p>
+<p>“先别急。”</p>
+<p>假设正常流量：</p>
+<pre><code class="language-text">10000 QPS
+</code></pre>
+<p>下游故障。</p>
+<p>每个请求重试：</p>
+<pre><code class="language-text">3 次
+</code></pre>
+<p>那么下游实际收到：</p>
+<pre><code class="language-text">40000 QPS
+</code></pre>
+<p>原本就已经扛不住。</p>
+<p>你又给它：</p>
+<pre><code class="language-text">4 倍流量
+</code></pre>
+<p>这叫：</p>
+<h3 id="retry-storm">Retry Storm</h3>
+<p>重试风暴。</p>
+<hr />
+<h2 id="_19">十八、重试不是不能用，而是不能无脑用</h2>
+<p>合理的重试通常需要：</p>
+<pre><code class="language-text">限制次数
++
+指数退避
++
+随机抖动
+</code></pre>
+<p>比如：</p>
+<p>第一次失败：</p>
+<pre><code class="language-text">100ms 后重试
+</code></pre>
+<p>第二次：</p>
+<pre><code class="language-text">200ms
+</code></pre>
+<p>第三次：</p>
+<pre><code class="language-text">400ms
+</code></pre>
+<p>而不是：</p>
+<pre><code class="language-text">失败
+↓
+立刻
+失败
+↓
+立刻
+失败
+↓
+立刻
+</code></pre>
+<p>这叫：</p>
+<h3 id="exponential-backoff">Exponential Backoff</h3>
+<p>指数退避。</p>
+<p>再加随机：</p>
+<pre><code class="language-text">100ms ± random
+</code></pre>
+<p>叫：</p>
+<h3 id="jitter">Jitter</h3>
+<p>抖动。</p>
+<hr />
+<h2 id="jitter_1">十九、为什么需要 Jitter？</h2>
+<p>假设 10 万个客户端同时失败。</p>
+<p>全部严格：</p>
+<pre><code class="language-text">1 秒后重试
+</code></pre>
+<p>那么一秒后：</p>
+<pre><code class="language-text">10 万请求
+</code></pre>
+<p>再次同时冲进来。</p>
+<p>像军队整齐冲锋。</p>
+<p>再失败：</p>
+<pre><code class="language-text">2 秒后
+</code></pre>
+<p>又一起冲锋。</p>
+<p>所以加随机：</p>
+<pre><code class="language-text">800ms
+932ms
+1044ms
+1170ms
+...
+</code></pre>
+<p>把重试打散。</p>
+<p>避免：</p>
+<h3 id="thundering-herd">Thundering Herd</h3>
+<p>惊群效应。</p>
+<hr />
+<h2 id="_20">二十、但是如果短信服务已经彻底挂了呢？</h2>
+<p>林默设置：</p>
+<pre><code class="language-text">300ms timeout
+3 次重试
+</code></pre>
+<p>可短信服务已经完全不可用。</p>
+<p>那么每一个订单请求还是会：</p>
+<pre><code class="language-text">失败
+↓
+重试
+↓
+失败
+↓
+重试
+↓
+失败
+</code></pre>
+<p>大量浪费资源。</p>
+<p>老周说：</p>
+<blockquote>
+<p>“既然已经知道它挂了，为什么还每次都去试？”</p>
+</blockquote>
+<p>于是系统设计里一个经典组件登场：</p>
+<h3 id="circuit-breaker">Circuit Breaker</h3>
+<p>熔断器。</p>
+<hr />
+<h2 id="_21">二十一、电路为什么需要保险丝？</h2>
+<p>家里电器短路。</p>
+<p>如果继续通电：</p>
+<pre><code class="language-text">电流越来越大
+↓
+线路发热
+↓
+起火
+</code></pre>
+<p>所以保险丝：</p>
+<pre><code class="language-text">发现异常
+↓
+直接断开电路
+</code></pre>
+<p>系统也是。</p>
+<p>如果下游连续失败：</p>
+<pre><code class="language-text">短信服务
+失败
+失败
+失败
+失败
+</code></pre>
+<p>熔断器判断：</p>
+<blockquote>
+<p>“这服务大概率挂了。”</p>
+</blockquote>
+<p>于是：</p>
+<pre><code class="language-text">暂时不再调用
+</code></pre>
+<p>直接快速失败。</p>
+<hr />
+<h2 id="_22">二十二、熔断器的三个状态</h2>
+<p>最经典的是：</p>
+<figure class="architecture"><div class="diagram-frame" tabindex="0" role="region" aria-label="熔断器的三个状态，可横向滚动"><img alt="熔断器的三个状态" src="diagrams/circuit-breaker.svg" /></div><figcaption>熔断器的三个状态<a href="diagrams/circuit-breaker.svg" target="_blank" rel="noopener">查看大图 ↗</a></figcaption></figure>
+<details class="original-diagram">
+<summary>查看文字版示意</summary>
+<pre><code class="language-text">CLOSED
+OPEN
+HALF_OPEN
+</code></pre>
+</details>
+<p>正常情况下：</p>
+<h3 id="closed">CLOSED</h3>
+<pre><code class="language-text">请求
+↓
+正常调用下游
+</code></pre>
+<p>Circuit 是“闭合”的。</p>
+<hr />
+<p>如果失败率超过阈值：</p>
+<pre><code class="language-text">最近 100 次
+60 次失败
+</code></pre>
+<p>变成：</p>
+<h3 id="open">OPEN</h3>
+<pre><code class="language-text">请求
+↓
+直接失败
+</code></pre>
+<p>根本不访问下游。</p>
+<p>这就是：</p>
+<blockquote>
+<p><strong>熔断。</strong></p>
+</blockquote>
+<hr />
+<p>过一段时间：</p>
+<pre><code class="language-text">30 秒
+</code></pre>
+<p>不能永远断着。</p>
+<p>所以进入：</p>
+<h3 id="half_open">HALF_OPEN</h3>
+<p>半开状态。</p>
+<p>先放少量探测请求：</p>
+<pre><code class="language-text">1 个
+5 个
+10 个
+</code></pre>
+<p>如果成功：</p>
+<pre><code class="language-text">下游恢复了
+↓
+CLOSED
+</code></pre>
+<p>如果继续失败：</p>
+<pre><code class="language-text">重新 OPEN
+</code></pre>
+<hr />
+<h2 id="_23">二十三、熔断保护的是谁？</h2>
+<p>林默本来以为：</p>
+<p>“保护下游？”</p>
+<p>老周说：</p>
+<p>“也保护你自己。”</p>
+<p>如果下游挂了还疯狂请求：</p>
+<pre><code class="language-text">你的线程被占
+你的连接被占
+你的 CPU 被重试占
+</code></pre>
+<p>所以熔断器同时保护：</p>
+<pre><code class="language-text">下游
++
+调用方
+</code></pre>
+<p>避免：</p>
+<pre><code class="language-text">一处故障
+↓
+整个系统跟着死
+</code></pre>
+<hr />
+<h2 id="_24">二十四、熔断以后，用户怎么办？</h2>
+<p>假设短信服务 OPEN。</p>
+<p>难道所有下单都返回：</p>
+<pre><code class="language-text">500
+</code></pre>
+<p>吗？</p>
+<p>林默想了想：</p>
+<p>“用户买东西，其实不一定非要马上收到短信。”</p>
+<p>老周：</p>
+<p>“对。”</p>
+<p>于是：</p>
+<h3 id="_25">降级</h3>
+<p>Degradation。</p>
+<p>正常：</p>
+<pre><code class="language-text">下单成功
+↓
+发送短信
+</code></pre>
+<p>短信挂：</p>
+<pre><code class="language-text">下单成功
+↓
+短信暂时跳过
+↓
+稍后补发
+</code></pre>
+<p>核心业务仍然继续。</p>
+<p>这就是：</p>
+<blockquote>
+<p><strong>牺牲非核心功能，保护核心功能。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_26">二十五、什么叫核心功能？</h2>
+<p>电商大促的时候：</p>
+<p>核心：</p>
+<pre><code class="language-text">登录
+商品浏览
+下单
+支付
+库存
+</code></pre>
+<p>非核心可能包括：</p>
+<pre><code class="language-text">推荐
+评论
+排行榜
+个性化头像
+积分实时更新
+短信立即送达
+</code></pre>
+<p>如果系统压力极大，可以临时：</p>
+<pre><code class="language-text">关闭推荐
+↓
+关闭实时排行榜
+↓
+评论只读
+↓
+部分统计延迟
+</code></pre>
+<p>把机器资源集中给：</p>
+<pre><code class="language-text">下单和支付
+</code></pre>
+<p>这就是：</p>
+<h3 id="_27">服务降级</h3>
+<hr />
+<h2 id="_28">二十六、降级和熔断有什么区别？</h2>
+<p>这是面试特别容易混的。</p>
+<p>林默写：</p>
+<h3 id="_29">熔断</h3>
+<p>关注：</p>
+<pre><code class="language-text">下游已经不健康
+</code></pre>
+<p>所以：</p>
+<pre><code class="language-text">暂时停止调用它
+</code></pre>
+<p>例如：</p>
+<pre><code class="language-text">短信服务连续失败
+↓
+不再访问短信服务
+</code></pre>
+<hr />
+<h3 id="_30">降级</h3>
+<p>关注：</p>
+<pre><code class="language-text">业务功能可以牺牲
+</code></pre>
+<p>所以：</p>
+<pre><code class="language-text">给一个简化结果
+</code></pre>
+<p>比如：</p>
+<pre><code class="language-text">推荐服务挂了
+↓
+返回默认热门商品
+</code></pre>
+<p>或者：</p>
+<pre><code class="language-text">评论系统压力过大
+↓
+暂时只展示旧数据
+</code></pre>
+<p>所以：</p>
+<blockquote>
+<p><strong>熔断是一种故障保护机制。</strong></p>
+<p><strong>降级是一种业务取舍。</strong></p>
+</blockquote>
+<p>两者经常一起使用。</p>
+<hr />
+<h2 id="fallback">二十七、Fallback</h2>
+<p>熔断之后，总不能什么都不给。</p>
+<p>所以经常设计：</p>
+<h3 id="fallback_1">Fallback</h3>
+<p>兜底。</p>
+<p>比如：</p>
+<pre><code class="language-text">推荐服务正常
+↓
+个性化推荐
+</code></pre>
+<p>挂了：</p>
+<pre><code class="language-text">Fallback
+↓
+热门商品
+</code></pre>
+<p>用户画像挂了：</p>
+<pre><code class="language-text">Fallback
+↓
+默认头像 + 默认昵称
+</code></pre>
+<p>商品评分服务挂了：</p>
+<pre><code class="language-text">Fallback
+↓
+暂时不显示评分
+</code></pre>
+<p>原则：</p>
+<blockquote>
+<p><strong>不是所有失败都必须让整个请求失败。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_31">二十八、然后又出现一个问题：线程池共享</h2>
+<p>订单服务有：</p>
+<pre><code class="language-text">200 个线程
+</code></pre>
+<p>调用：</p>
+<pre><code class="language-text">支付
+短信
+积分
+推荐
+</code></pre>
+<p>全都用同一个线程池。</p>
+<p>某天推荐服务巨慢。</p>
+<p>大量线程卡在：</p>
+<pre><code class="language-text">推荐服务
+</code></pre>
+<p>结果支付请求来了，却发现：</p>
+<pre><code class="language-text">没有线程
+</code></pre>
+<p>于是：</p>
+<pre><code class="language-text">推荐服务故障
+↓
+竟然把支付也拖死
+</code></pre>
+<p>老周写：</p>
+<h3 id="isolation">Isolation</h3>
+<p>隔离。</p>
+<hr />
+<h2 id="_32">二十九、隔离：别让一个坏邻居占光资源</h2>
+<p>比如分别设置：</p>
+<pre><code class="language-text">支付线程池：100
+短信线程池：30
+推荐线程池：30
+其他：40
+</code></pre>
+<p>即使推荐：</p>
+<pre><code class="language-text">30 个线程全部卡死
+</code></pre>
+<p>支付还有：</p>
+<pre><code class="language-text">100 个线程
+</code></pre>
+<p>这叫：</p>
+<h3 id="bulkhead-pattern">Bulkhead Pattern</h3>
+<p>舱壁模式。</p>
+<p>名字来自轮船。</p>
+<hr />
+<h2 id="_33">三十、为什么叫舱壁？</h2>
+<p>一艘船如果内部完全连通。</p>
+<p>某处破洞：</p>
+<pre><code class="language-text">水灌进来
+↓
+整个船舱进水
+↓
+沉船
+</code></pre>
+<p>如果分隔成：</p>
+<pre><code class="language-text">舱 A
+舱 B
+舱 C
+舱 D
+</code></pre>
+<p>A 破了：</p>
+<pre><code class="language-text">只淹 A
+</code></pre>
+<p>其他舱还能保持浮力。</p>
+<p>分布式系统也是：</p>
+<pre><code class="language-text">资源隔离
+线程池隔离
+连接池隔离
+实例隔离
+租户隔离
+</code></pre>
+<p>核心目的：</p>
+<blockquote>
+<p><strong>让故障有边界。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_34">三十一、这句话非常重要：故障不可避免，但可以隔离</h2>
+<p>老周说：</p>
+<blockquote>
+<p>“大型系统真正追求的，不是永远不出故障。”</p>
+</blockquote>
+<p>林默：</p>
+<p>“那追求什么？”</p>
+<blockquote>
+<p>“故障发生以后，别扩散。”</p>
+</blockquote>
+<p>比如：</p>
+<pre><code class="language-text">推荐挂
+</code></pre>
+<p>最好结果：</p>
+<pre><code class="language-text">推荐不可用
+</code></pre>
+<p>而不是：</p>
+<pre><code class="language-text">推荐挂
+↓
+订单挂
+↓
+支付挂
+↓
+整个网站挂
+</code></pre>
+<p>系统设计里的：</p>
+<pre><code class="language-text">限流
+熔断
+隔离
+降级
+</code></pre>
+<p>本质上都在做同一件事：</p>
+<h3 id="_35">控制故障半径</h3>
+<p>Blast Radius。</p>
+<hr />
+<h2 id="_36">三十二、入口保护的完整链路</h2>
+<p>林默重新设计系统：</p>
+<pre><code class="language-text">Internet
+   ↓
+CDN / WAF
+   ↓
+Gateway
+   ↓
+限流
+   ↓
+鉴权
+   ↓
+App
+   ↓
+下游服务
+</code></pre>
+<p>当系统正常：</p>
+<pre><code class="language-text">全部功能开放
+</code></pre>
+<p>高峰：</p>
+<pre><code class="language-text">限流
+</code></pre>
+<p>部分服务变慢：</p>
+<pre><code class="language-text">Timeout
+</code></pre>
+<p>持续失败：</p>
+<pre><code class="language-text">Circuit Breaker
+</code></pre>
+<p>非核心服务故障：</p>
+<pre><code class="language-text">Fallback / Degradation
+</code></pre>
+<p>防止影响其他模块：</p>
+<pre><code class="language-text">Isolation
+</code></pre>
+<p>这一套组合起来，就是系统稳定性的基本防线。</p>
+<hr />
+<h2 id="_37">三十三、一次真正的事故演练</h2>
+<p>老周突然说：</p>
+<p>“假设支付服务现在变慢，你告诉我系统会怎么死。”</p>
+<p>林默开始推演。</p>
+<p>正常：</p>
+<pre><code class="language-text">用户
+↓
+订单服务
+↓
+支付服务
+</code></pre>
+<p>支付服务耗时：</p>
+<pre><code class="language-text">50ms
+</code></pre>
+<p>突然数据库锁竞争。</p>
+<p>变成：</p>
+<pre><code class="language-text">5s
+</code></pre>
+<p>第一步：</p>
+<pre><code class="language-text">支付请求大量堆积
+</code></pre>
+<p>第二步：</p>
+<pre><code class="language-text">订单线程等待支付
+</code></pre>
+<p>第三步：</p>
+<pre><code class="language-text">订单线程池耗尽
+</code></pre>
+<p>第四步：</p>
+<pre><code class="language-text">新订单无法处理
+</code></pre>
+<p>第五步：</p>
+<pre><code class="language-text">客户端 timeout
+</code></pre>
+<p>第六步：</p>
+<p>客户端自动重试：</p>
+<pre><code class="language-text">流量翻倍
+</code></pre>
+<p>第七步：</p>
+<pre><code class="language-text">支付更加慢
+</code></pre>
+<p>形成正反馈：</p>
+<pre><code class="language-text">越慢
+↓
+请求越积压
+↓
+重试越多
+↓
+更慢
+</code></pre>
+<p>最终：</p>
+<pre><code class="language-text">雪崩
+</code></pre>
+<hr />
+<h2 id="_38">三十四、怎么阻止这条链路？</h2>
+<p>林默重新推演。</p>
+<p>支付开始变慢。</p>
+<h3 id="_39">第一层</h3>
+<pre><code class="language-text">Timeout = 500ms
+</code></pre>
+<p>不要卡 5 秒。</p>
+<h3 id="_40">第二层</h3>
+<p>重试：</p>
+<pre><code class="language-text">最多 1~2 次
+指数退避 + Jitter
+</code></pre>
+<h3 id="_41">第三层</h3>
+<p>失败率持续升高：</p>
+<pre><code class="language-text">Circuit Breaker OPEN
+</code></pre>
+<p>停止继续攻击支付服务。</p>
+<h3 id="_42">第四层</h3>
+<p>支付线程池独立：</p>
+<pre><code class="language-text">不占光订单服务所有线程
+</code></pre>
+<h3 id="_43">第五层</h3>
+<p>入口限流：</p>
+<pre><code class="language-text">减少新请求
+</code></pre>
+<h3 id="_44">第六层</h3>
+<p>降级：</p>
+<pre><code class="language-text">非支付核心功能关闭
+</code></pre>
+<p>系统虽然受损：</p>
+<pre><code class="language-text">部分支付失败
+</code></pre>
+<p>但不会：</p>
+<pre><code class="language-text">整个网站一起挂
+</code></pre>
+<p>老周点头。</p>
+<p>“这才叫稳定性设计。”</p>
+<hr />
+<h2 id="_45">三十五、限流、熔断、降级、隔离终于串起来了</h2>
+<p>不要把它们当四个孤立八股。</p>
+<p>真正关系是：</p>
+<pre><code class="language-text">请求太多
+↓
+限流
+</code></pre>
+<pre><code class="language-text">下游太慢
+↓
+Timeout
+</code></pre>
+<pre><code class="language-text">下游持续失败
+↓
+熔断
+</code></pre>
+<pre><code class="language-text">部分功能可以牺牲
+↓
+降级
+</code></pre>
+<pre><code class="language-text">防止一个模块拖死其他模块
+↓
+隔离
+</code></pre>
+<p>共同目标：</p>
+<pre><code class="language-text">防止系统雪崩
+</code></pre>
+<hr />
+<h2 id="_46">三十六、系统设计开始出现一个更深的原则</h2>
+<p>林默看着现在的架构：</p>
+<pre><code class="language-text">用户
+ ↓
+Gateway
+ ↓
+Rate Limiter
+ ↓
+App
+ ↓
+Circuit Breaker
+ ↓
+Service
+ ↓
+Redis / MQ / DB
+</code></pre>
+<p>突然问：</p>
+<p>“我们是不是一直在承认一件事情？”</p>
+<p>老周：</p>
+<p>“什么？”</p>
+<p>林默说：</p>
+<blockquote>
+<p>“系统里的任何东西，都可能挂。”</p>
+</blockquote>
+<p>Redis 会挂。</p>
+<p>MySQL 会挂。</p>
+<p>MQ 会挂。</p>
+<p>支付会挂。</p>
+<p>网络会挂。</p>
+<p>机器会挂。</p>
+<p>老周笑了。</p>
+<blockquote>
+<p>“欢迎真正进入分布式系统。”</p>
+</blockquote>
+<p>系统设计不是假设：</p>
+<pre><code class="language-text">一切正常
+</code></pre>
+<p>然后设计最快的路径。</p>
+<p>而是：</p>
+<pre><code class="language-text">正常时怎么跑
++
+异常时怎么活
+</code></pre>
+<p>这两个问题同样重要。</p>
+<hr />
+<h2 id="_47">第六章结束</h2>
+<p>这一章的核心因果链：</p>
+<pre><code class="language-text">流量太大
+↓
+App 也会被冲垮
+↓
+限流
+↓
+固定窗口 / 滑动窗口
+↓
+漏桶 / 令牌桶
+↓
+主动拒绝部分请求
+↓
+下游服务变慢
+↓
+Timeout
+↓
+无脑重试造成 Retry Storm
+↓
+指数退避 + Jitter
+↓
+下游持续失败
+↓
+Circuit Breaker
+↓
+OPEN / HALF_OPEN / CLOSED
+↓
+非核心功能舍弃
+↓
+降级 + Fallback
+↓
+共享资源导致故障扩散
+↓
+隔离 / Bulkhead
+↓
+最终目标：防止服务雪崩
+</code></pre>
+<p>现在如果面试官问：</p>
+<blockquote>
+<p><strong>“上游 1 万并发，但下游大模型接口最多只能承受 500 并发，你怎么设计？”</strong></p>
+</blockquote>
+<p>你的思路就不应该只有之前的：</p>
+<pre><code class="language-text">MQ 削峰
+</code></pre>
+<p>而应该开始分情况：</p>
+<blockquote>
+<p>如果请求允许异步，可以用 MQ 削峰，让下游按自身吞吐稳定消费；如果是必须同步返回的请求，则要在入口做限流和并发控制，超过系统容量的请求快速失败或排队。同时设置合理超时，避免连接长期占用；对于持续异常的下游启用熔断，防止故障扩散；非核心功能可以降级。如果需要重试，则限制次数，并配合指数退避和随机抖动，避免形成重试风暴。</p>
+</blockquote>
+<p>这已经是一个相当完整的系统设计回答框架了。</p>
+<p>下一章我们该解决另外一个越来越明显的问题：</p>
+<h3 id="cdndns">下一章：服务器明明在北京，为什么广州用户打开图片要两秒？——CDN、DNS 与静态资源</h3>
+<p>会开始把系统从“服务器内部”拉到整个互联网：</p>
+<p><strong>DNS 怎么找到服务器 → CDN 为什么快 → 边缘节点 → 回源 → Cache-Control → 静态资源与动态请求 → CDN 缓存一致性 → 多地域部署 → 就近访问。</strong></p></article><nav class="chapter-nav" aria-label="章节切换"><a href="chapter-05.html" rel="prev">← 上一章</a><a href="chapter-07.html" rel="next">下一章 →</a></nav></main></div><footer>系统设计：从一台服务器开始<br><small>现有 8 章 · 连载中 · 第九章待续</small><p><a href="editorial.html">整理说明与技术参考</a> · <a href="https://github.com/wupzl/system-design-reader">项目源码 ↗</a></p></footer></body></html>

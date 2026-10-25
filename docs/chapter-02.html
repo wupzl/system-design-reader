@@ -1,0 +1,913 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><meta name="description" content="系统设计：从一台服务器开始。跟随林默与老周，在八章故事中理解缓存、数据库、消息队列与分布式共识。连载中，第九章待续。"><title>消失的登录状态——Redis 为什么会出现 · 系统设计</title><script>try{document.documentElement.dataset.theme=localStorage.getItem('reader-theme')||'white';document.documentElement.style.setProperty('--reading-size',Math.max(16,Math.min(26,Number(localStorage.getItem('reader-size'))||18))+'px')}catch(e){}</script><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="shelf-nav.css"><link rel="stylesheet" href="reader.css"><script src="app.js" defer></script></head>
+<body class="reading"><a class="skip" href="#main">跳到正文</a><header><a class="brand" href="index.html">系统设计<span>SYSTEM DESIGN</span></a><nav class="shelf-nav" aria-label="学习项目导航"><a class="shelf-home" href="/">← 学习书架</a><details class="shelf-switch"><summary>切换项目 ▾</summary><div class="shelf-menu"><a href="/pytorch-apprentice/">PyTorch：炼金术士的学徒</a><a href="/ai-era-reader/">AI 纪元</a><a href="/data-empire-reader/">数据帝国</a><a href="/rag-empire-reader/">RAG 帝国</a><a href="/system-design-reader/" aria-current="page">系统设计</a></div></details></nav><div class="controls"><button id="smaller" aria-label="缩小字号" type="button">A−</button><button id="larger" aria-label="增大字号" type="button">A＋</button><button id="theme" aria-label="切换阅读背景" type="button">纯白</button></div></header>
+<div class="reader-layout"><aside><a href="index.html">← 全书目录</a><p class="eyebrow">本章导航</p><div class="toc">
+<ul>
+<li><a href="#a">一、最简单的办法：你以后一直去 A</a></li>
+<li><a href="#_1">二、第二种方案：大家复制一份</a></li>
+<li><a href="#_2">三、第三种方案：把状态搬出去</a></li>
+<li><a href="#_4">四、什么叫无状态？</a></li>
+<li><a href="#redis">五、Redis 第一次正式进入系统</a></li>
+<li><a href="#redis-session">六、Redis 不只是拿来存 Session</a></li>
+<li><a href="#_5">七、缓存出现</a></li>
+<li><a href="#_6">八、缓存的本质</a></li>
+<li><a href="#cache-aside">九、Cache Aside</a></li>
+<li><a href="#_7">十、一个不存在的用户</a></li>
+<li><a href="#_9">十一、怎么解决缓存穿透？</a></li>
+<li><a href="#_11">十二、城门口的名单</a></li>
+<li><a href="#_12">十三、第二场缓存灾难</a></li>
+<li><a href="#_14">十四、互斥锁</a></li>
+<li><a href="#_15">十五、第三场灾难更加恐怖</a></li>
+<li><a href="#_17">十六、穿透、击穿、雪崩终于可以不背了</a></li>
+<li><a href="#redis_1">十七、Redis 自己挂了怎么办？</a></li>
+<li><a href="#_18">第二章结束</a></li>
+</ul>
+</div>
+</aside><main id="main"><div class="chapter-heading"><p class="eyebrow">CHAPTER 02 / 08 · 连载中</p><h1>消失的登录状态——Redis 为什么会出现</h1><p>共享会话 · 旁路缓存 · 缓存故障</p></div><details class="mobile-toc"><summary>展开本章目录</summary><div class="toc">
+<ul>
+<li><a href="#a">一、最简单的办法：你以后一直去 A</a></li>
+<li><a href="#_1">二、第二种方案：大家复制一份</a></li>
+<li><a href="#_2">三、第三种方案：把状态搬出去</a></li>
+<li><a href="#_4">四、什么叫无状态？</a></li>
+<li><a href="#redis">五、Redis 第一次正式进入系统</a></li>
+<li><a href="#redis-session">六、Redis 不只是拿来存 Session</a></li>
+<li><a href="#_5">七、缓存出现</a></li>
+<li><a href="#_6">八、缓存的本质</a></li>
+<li><a href="#cache-aside">九、Cache Aside</a></li>
+<li><a href="#_7">十、一个不存在的用户</a></li>
+<li><a href="#_9">十一、怎么解决缓存穿透？</a></li>
+<li><a href="#_11">十二、城门口的名单</a></li>
+<li><a href="#_12">十三、第二场缓存灾难</a></li>
+<li><a href="#_14">十四、互斥锁</a></li>
+<li><a href="#_15">十五、第三场灾难更加恐怖</a></li>
+<li><a href="#_17">十六、穿透、击穿、雪崩终于可以不背了</a></li>
+<li><a href="#redis_1">十七、Redis 自己挂了怎么办？</a></li>
+<li><a href="#_18">第二章结束</a></li>
+</ul>
+</div>
+</details><article><p>林默原本以为，加了负载均衡之后，系统终于稳定了。</p>
+<p>现在架构是：</p>
+<pre><code class="language-text">                ┌→ App A
+用户 → Nginx ───┤
+                └→ App B
+                      │
+                      ▼
+                    MySQL
+</code></pre>
+<p>直到用户开始疯狂投诉：</p>
+<blockquote>
+<p>“为什么我一会儿登录，一会儿又掉线？”</p>
+</blockquote>
+<p>林默一查日志，发现问题正是上一章留下的那个坑。</p>
+<p>用户第一次登录：</p>
+<pre><code class="language-text">请求 → App A
+</code></pre>
+<p>于是：</p>
+<pre><code class="language-text">App A 内存：
+
+session_123 → user_9527
+</code></pre>
+<p>下一次请求却被 Nginx 发给：</p>
+<pre><code class="language-text">App B
+</code></pre>
+<p>App B 一查：</p>
+<pre><code class="language-text">session_123？
+</code></pre>
+<p>不存在。</p>
+<p>于是：</p>
+<pre><code class="language-text">401 Unauthorized
+</code></pre>
+<hr />
+<h2 id="a">一、最简单的办法：你以后一直去 A</h2>
+<p>林默想了个办法。</p>
+<p>“既然 Session 在 A，那这个用户之后的请求都发给 A 不就行了？”</p>
+<p>老周点点头：</p>
+<p>“可以。”</p>
+<p>这叫：</p>
+<h3 id="sticky-session">Sticky Session</h3>
+<p>粘性会话。</p>
+<p>比如负载均衡器记录：</p>
+<pre><code class="language-text">user1 → App A
+user2 → App B
+user3 → App A
+</code></pre>
+<p>以后 user1 的请求始终：</p>
+<pre><code class="language-text">→ App A
+</code></pre>
+<p>看起来解决了。</p>
+<p>但老周问：</p>
+<p>“App A 挂了呢？”</p>
+<p>林默：</p>
+<p>“……”</p>
+<p>App A 一挂：</p>
+<pre><code class="language-text">user1 的 Session
+一起没了
+</code></pre>
+<p>而且可能出现：</p>
+<pre><code class="language-text">App A：1万个用户
+App B：100个用户
+</code></pre>
+<p>负载严重不均。</p>
+<p>所以 Sticky Session 能用，但不是特别优雅。</p>
+<hr />
+<h2 id="_1">二、第二种方案：大家复制一份</h2>
+<p>林默又想：</p>
+<p>“那 A 有 Session 后，复制给 B。”</p>
+<p>于是：</p>
+<pre><code class="language-text">App A
+  │
+  ├── session123
+  │
+  ▼
+复制
+  │
+  ▼
+App B
+</code></pre>
+<p>如果有三台机器：</p>
+<pre><code class="language-text">A → B
+A → C
+</code></pre>
+<p>那么大家都有：</p>
+<pre><code class="language-text">session123 → user9527
+</code></pre>
+<p>这叫：</p>
+<h3 id="session-replication">Session Replication</h3>
+<p>Session 复制。</p>
+<p>但用户越来越多以后：</p>
+<pre><code class="language-text">10万 Session
+100万 Session
+1000万 Session
+</code></pre>
+<p>每创建一个 Session：</p>
+<pre><code class="language-text">A → B
+A → C
+A → D
+A → E
+</code></pre>
+<p>大量网络同步。</p>
+<p>如果有 100 台服务器呢？</p>
+<p>林默脑补了一下：</p>
+<pre><code class="language-text">一个 Session
+复制 99 次
+</code></pre>
+<p>“这是不是有点蠢？”</p>
+<p>老周：</p>
+<p>“开始有架构师的味道了。”</p>
+<hr />
+<h2 id="_2">三、第三种方案：把状态搬出去</h2>
+<p>老周重新画了一张图。</p>
+<figure class="architecture"><div class="diagram-frame" tabindex="0" role="region" aria-label="把会话状态移出应用内存，可横向滚动"><img alt="把会话状态移出应用内存" src="diagrams/shared-session.svg" /></div><figcaption>把会话状态移出应用内存<a href="diagrams/shared-session.svg" target="_blank" rel="noopener">查看大图 ↗</a></figcaption></figure>
+<details class="original-diagram">
+<summary>查看文字版示意</summary>
+<pre><code class="language-text">                 ┌→ App A ─┐
+用户 → LB ───────┤          │
+                 └→ App B ─┤
+                            ▼
+                         Redis
+</code></pre>
+</details>
+<p>App A 和 App B：</p>
+<p><strong>都不保存 Session。</strong></p>
+<p>它们统一访问 Redis。</p>
+<p>登录时：</p>
+<pre><code class="language-text">SET session:123 user:9527
+</code></pre>
+<p>下一次请求到 A：</p>
+<pre><code class="language-text">GET session:123
+</code></pre>
+<p>下一次请求到 B：</p>
+<pre><code class="language-text">GET session:123
+</code></pre>
+<p>在 Redis 可用且会话未过期的前提下，两台应用能够查询同一份会话状态。</p>
+<p>林默眼睛一亮：</p>
+<blockquote>
+<p>“所以 Session 不属于某一台服务器了。”</p>
+</blockquote>
+<p>“对。”</p>
+<p>这就是大型系统里一个非常重要的思想：</p>
+<h3 id="_3">无状态服务</h3>
+<p>Stateless Service。</p>
+<hr />
+<h2 id="_4">四、什么叫无状态？</h2>
+<p>假设 App A 收到请求。</p>
+<p>如果处理这个请求需要的信息都在：</p>
+<pre><code class="language-text">请求本身
++
+共享存储
+</code></pre>
+<p>而不是：</p>
+<pre><code class="language-text">App A 自己的内存
+</code></pre>
+<p>那么这个 App 就可以认为是无状态的。</p>
+<p>于是：</p>
+<pre><code class="language-text">请求1 → A
+请求2 → B
+请求3 → C
+</code></pre>
+<p>都无所谓。</p>
+<p>这件事极其重要。</p>
+<p>因为只有无状态，你才可以非常轻松地：</p>
+<pre><code class="language-text">2台服务器
+↓
+10台
+↓
+100台
+↓
+1000台
+</code></pre>
+<p>服务器不够？</p>
+<p>加。</p>
+<p>服务器坏了？</p>
+<p>删。</p>
+<p>服务器升级？</p>
+<p>替换。</p>
+<p>不需要担心：</p>
+<blockquote>
+<p>“用户数据是不是存在某一台机器里？”</p>
+</blockquote>
+<p>所以你以后看到 Kubernetes、容器、自动扩缩容时，会发现一个共同前提：</p>
+<blockquote>
+<p><strong>应用服务最好无状态。</strong></p>
+</blockquote>
+<hr />
+<h2 id="redis">五、Redis 第一次正式进入系统</h2>
+<p>林默开始研究 Redis。</p>
+<p>然后发现一个奇怪的事情。</p>
+<p>Redis 数据主要放在：</p>
+<pre><code class="language-text">内存
+</code></pre>
+<p>而 MySQL 数据主要放在：</p>
+<pre><code class="language-text">磁盘
+</code></pre>
+<p>林默问：</p>
+<p>“为什么 Session 不直接放 MySQL？”</p>
+<p>当然可以。</p>
+<p>比如：</p>
+<pre><code class="language-sql">SELECT user_id
+FROM session
+WHERE session_id = '123';
+</code></pre>
+<p>但是问题在于：</p>
+<p>每个请求都需要认证。</p>
+<p>假设：</p>
+<pre><code class="language-text">10000 QPS
+</code></pre>
+<p>意味着可能：</p>
+<pre><code class="language-text">每秒 10000 次 Session 查询
+</code></pre>
+<p>这些请求全部打到 MySQL。</p>
+<p>而 Session 查询本身又非常简单：</p>
+<pre><code class="language-text">key → value
+</code></pre>
+<p>例如：</p>
+<pre><code class="language-text">session:123
+    ↓
+user:9527
+</code></pre>
+<p>并不需要复杂 SQL。</p>
+<p>所以用一个擅长：</p>
+<pre><code class="language-text">高频
+简单
+Key-Value
+内存访问
+</code></pre>
+<p>的系统更合适。</p>
+<p>Redis 就很适合这种工作。</p>
+<hr />
+<h2 id="redis-session">六、Redis 不只是拿来存 Session</h2>
+<p>几周后。</p>
+<p>另一个事故来了。</p>
+<p>首页有一个接口：</p>
+<pre><code class="language-text">GET /user/9527
+</code></pre>
+<p>查询：</p>
+<pre><code class="language-sql">SELECT *
+FROM user
+WHERE id = 9527;
+</code></pre>
+<p>平时没什么问题。</p>
+<p>但是某个大主播火了。</p>
+<p>100 万人疯狂打开他的主页。</p>
+<p>数据库里不断执行：</p>
+<pre><code class="language-sql">SELECT *
+FROM user
+WHERE id = 9527;
+
+SELECT *
+FROM user
+WHERE id = 9527;
+
+SELECT *
+FROM user
+WHERE id = 9527;
+
+SELECT *
+FROM user
+WHERE id = 9527;
+</code></pre>
+<p>数据每次都完全一样。</p>
+<p>林默看着 MySQL CPU：</p>
+<pre><code class="language-text">92%
+95%
+97%
+</code></pre>
+<p>突然感觉哪里不对。</p>
+<p>“100 万个人查同一个东西，我为什么要让 MySQL 查 100 万次？”</p>
+<p>老周：</p>
+<p>“终于问到缓存真正的核心问题了。”</p>
+<hr />
+<h2 id="_5">七、缓存出现</h2>
+<p>第一次查询：</p>
+<pre><code class="language-text">用户
+ ↓
+Redis
+ ↓
+没有
+ ↓
+MySQL
+ ↓
+查到数据
+ ↓
+写入 Redis
+</code></pre>
+<p>Redis：</p>
+<pre><code class="language-text">user:9527
+=
+{
+  name: &quot;林某某&quot;,
+  avatar: &quot;...&quot;,
+  followers: 10000000
+}
+</code></pre>
+<p>之后：</p>
+<pre><code class="language-text">用户
+ ↓
+Redis
+ ↓
+直接返回
+</code></pre>
+<p>于是原来：</p>
+<pre><code class="language-text">10000 QPS
+全部 → MySQL
+</code></pre>
+<p>变成：</p>
+<pre><code class="language-text">10000 QPS
+   │
+   ├── 9900 → Redis
+   │
+   └── 100 → MySQL
+</code></pre>
+<p>数据库压力瞬间下降。</p>
+<p>林默第一次真正理解：</p>
+<blockquote>
+<p><strong>Redis 最核心的价值之一，不是“快”这么简单。</strong></p>
+</blockquote>
+<p>而是：</p>
+<blockquote>
+<p><strong>替后面的慢系统挡请求。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_6">八、缓存的本质</h2>
+<p>老周问：</p>
+<p>“为什么 Redis 可以做缓存？”</p>
+<p>林默说：</p>
+<p>“因为它快。”</p>
+<p>“还不完整。”</p>
+<p>老周画：</p>
+<pre><code class="language-text">CPU Cache
+   ↓
+内存
+   ↓
+SSD
+   ↓
+机械硬盘
+   ↓
+远程服务
+</code></pre>
+<p>计算机系统里大量设计都有同一个规律：</p>
+<blockquote>
+<p><strong>把常用的数据放到离使用者更近、更快的地方。</strong></p>
+</blockquote>
+<p>比如 CPU：</p>
+<pre><code class="language-text">寄存器
+L1
+L2
+L3
+内存
+磁盘
+</code></pre>
+<p>Web 系统也是：</p>
+<pre><code class="language-text">浏览器缓存
+ ↓
+CDN
+ ↓
+Nginx
+ ↓
+Redis
+ ↓
+MySQL
+</code></pre>
+<p>这和内存层级的思路相似：尽量把热门数据放在离使用者更近的位置。不过，浏览器、CDN、Redis 与数据库的延迟、容量和成本取决于实际部署，不能直接套用 CPU 缓存的价格与容量关系。</p>
+<p>所以缓存不是 Redis 专属概念。</p>
+<p>Redis 只是：</p>
+<blockquote>
+<p><strong>分布式系统里非常常见的一层缓存。</strong></p>
+</blockquote>
+<hr />
+<h2 id="cache-aside">九、Cache Aside</h2>
+<p>林默于是写出了经典代码。</p>
+<p>查询：</p>
+<pre><code class="language-java">User user = redis.get(&quot;user:&quot; + id);
+
+if (user == null) {
+    user = mysql.selectUser(id);
+    redis.set(&quot;user:&quot; + id, user);
+}
+
+return user;
+</code></pre>
+<p>这叫：</p>
+<h3 id="cache-aside-pattern">Cache Aside Pattern</h3>
+<p>旁路缓存。</p>
+<p>流程：</p>
+<pre><code class="language-text">读：
+
+先 Redis
+   ↓
+有 → 返回
+
+没有
+ ↓
+查 DB
+ ↓
+写 Redis
+ ↓
+返回
+</code></pre>
+<p>这是面试中最常见的缓存模式之一。</p>
+<p>林默觉得：</p>
+<p>“这也不难。”</p>
+<p>老周看了他一眼。</p>
+<p>“系统设计里最危险的时刻，就是你觉得问题解决了的时候。”</p>
+<hr />
+<h2 id="_7">十、一个不存在的用户</h2>
+<p>某天有人恶意请求：</p>
+<pre><code class="language-text">GET /user/999999999
+</code></pre>
+<p>数据库中根本没有这个用户。</p>
+<p>流程：</p>
+<pre><code class="language-text">Redis
+ ↓
+没有
+ ↓
+MySQL
+ ↓
+也没有
+</code></pre>
+<p>下一次：</p>
+<pre><code class="language-text">Redis
+ ↓
+还是没有
+ ↓
+MySQL
+</code></pre>
+<p>因为：</p>
+<pre><code class="language-text">不存在的数据
+没有被缓存
+</code></pre>
+<p>攻击者开始不断随机请求：</p>
+<pre><code class="language-text">/user/111111111
+/user/222222222
+/user/333333333
+...
+</code></pre>
+<p>Redis 全部 Miss。</p>
+<p>请求全部穿过去：</p>
+<pre><code class="language-text">攻击者
+  ↓
+Redis
+  ↓
+Redis 没有
+  ↓
+MySQL
+</code></pre>
+<p>Redis 仿佛不存在一样。</p>
+<p>数据库开始冒烟。</p>
+<p>老周在白板写下四个字：</p>
+<h3 id="_8">缓存穿透</h3>
+<p>Cache Penetration。</p>
+<p>核心特点：</p>
+<blockquote>
+<p><strong>请求的数据，缓存没有，数据库也没有。</strong></p>
+</blockquote>
+<p>所以每一次请求都会穿过缓存。</p>
+<hr />
+<h2 id="_9">十一、怎么解决缓存穿透？</h2>
+<p>最简单的方法：</p>
+<p>即使没查到，也缓存。</p>
+<p>比如：</p>
+<pre><code class="language-text">user:99999999 → NULL
+</code></pre>
+<p>设置一个较短 TTL：</p>
+<pre><code class="language-text">60 秒
+</code></pre>
+<p>于是：</p>
+<p>第一次：</p>
+<pre><code class="language-text">Redis Miss
+↓
+DB Miss
+↓
+Redis 写 NULL
+</code></pre>
+<p>后面请求：</p>
+<pre><code class="language-text">Redis Hit(NULL)
+</code></pre>
+<p>不用继续打 DB。</p>
+<p>这叫：</p>
+<h3 id="_10">缓存空值</h3>
+<p>但是如果攻击者每次随机生成新 ID：</p>
+<pre><code class="language-text">111
+222
+333
+444
+...
+</code></pre>
+<p>还是没用。</p>
+<p>于是另一个东西出现：</p>
+<h3 id="bloom-filter">Bloom Filter</h3>
+<p>布隆过滤器。</p>
+<hr />
+<h2 id="_11">十二、城门口的名单</h2>
+<p>你可以把 Bloom Filter 想象成：</p>
+<blockquote>
+<p>数据库城堡外面的门卫。</p>
+</blockquote>
+<p>数据库中现有：</p>
+<pre><code class="language-text">user1
+user2
+user3
+...
+user1000000
+</code></pre>
+<p>门卫拿着一份特殊名单。</p>
+<p>请求：</p>
+<pre><code class="language-text">user9527
+</code></pre>
+<p>门卫检查：</p>
+<pre><code class="language-text">“可能存在。”
+</code></pre>
+<p>放进去。</p>
+<p>请求：</p>
+<pre><code class="language-text">user999999999999
+</code></pre>
+<p>门卫：</p>
+<pre><code class="language-text">“一定不存在。”
+</code></pre>
+<p>直接拒绝。</p>
+<p>于是：</p>
+<pre><code class="language-text">请求
+ ↓
+Bloom Filter
+ ↓
+一定不存在 → 返回
+ ↓
+可能存在
+ ↓
+Redis
+ ↓
+MySQL
+</code></pre>
+<p>为什么叫“可能存在”？</p>
+<p>因为布隆过滤器有一个特点：</p>
+<pre><code class="language-text">它说不存在
+→ 一定不存在
+
+它说存在
+→ 可能存在
+</code></pre>
+<p>存在一定概率误判。</p>
+<p>但用很小的空间，可以表示海量数据。</p>
+<blockquote>
+<p><strong>工程补充</strong>：“一定不存在”针对的是已经加入且未被错误删除的集合。若新增记录还没同步到过滤器，就可能误挡真实数据；需要设计更新顺序、故障回退和重建机制。缓存空值也应使用可区分的占位值，并设置短 TTL。</p>
+</blockquote>
+<hr />
+<h2 id="_12">十三、第二场缓存灾难</h2>
+<p>某天，一个明星发动态。</p>
+<p>他的用户信息正好缓存在 Redis：</p>
+<pre><code class="language-text">user:9527
+</code></pre>
+<p>TTL：</p>
+<pre><code class="language-text">3600 秒
+</code></pre>
+<p>晚上 8 点整。</p>
+<p>这个 Key 过期了。</p>
+<p>与此同时：</p>
+<pre><code class="language-text">10 万用户
+</code></pre>
+<p>刚好一起刷新他的主页。</p>
+<p>瞬间：</p>
+<pre><code class="language-text">100000 请求
+ ↓
+Redis
+ ↓
+全部 Miss
+ ↓
+MySQL
+</code></pre>
+<p>数据库：</p>
+<pre><code class="language-text">？？？？？
+</code></pre>
+<p>刚才缓存还帮数据库挡住所有请求。</p>
+<p>结果 Key 一过期：</p>
+<blockquote>
+<p>所有请求瞬间打穿。</p>
+</blockquote>
+<p>老周写：</p>
+<h3 id="_13">缓存击穿</h3>
+<p>Cache Breakdown / Hot Key Expiration。</p>
+<p>核心：</p>
+<blockquote>
+<p><strong>某一个热点 Key 失效，大量请求同时访问数据库。</strong></p>
+</blockquote>
+<p>注意和穿透不同。</p>
+<p>穿透：</p>
+<pre><code class="language-text">数据本来就不存在
+</code></pre>
+<p>击穿：</p>
+<pre><code class="language-text">数据存在
+而且特别热
+但缓存突然失效
+</code></pre>
+<hr />
+<h2 id="_14">十四、互斥锁</h2>
+<p>解决思路之一：</p>
+<p>当 Redis Miss 时，不让 10 万请求一起查询数据库。</p>
+<p>只有一个请求获得锁。</p>
+<pre><code class="language-text">100000 个请求
+       ↓
+       锁
+       ↓
+只有 1 个进去
+       ↓
+     MySQL
+       ↓
+写回 Redis
+</code></pre>
+<p>其他请求：</p>
+<pre><code class="language-text">等待
+</code></pre>
+<p>然后：</p>
+<pre><code class="language-text">重新查询 Redis
+</code></pre>
+<p>伪代码：</p>
+<pre><code class="language-java">// 示意代码：具体 API 由 Redis 客户端与业务实现提供
+for (int attempt = 0; attempt &lt; MAX_RETRIES; attempt++) {
+    data = cache.get(key);
+    if (data != null) return data;
+
+    token = randomUniqueToken();
+    if (tryLock(lockKey, token, LOCK_TTL)) {
+        try {
+            data = cache.get(key); // 获锁后再次检查
+            if (data == null) {
+                data = db.query();
+                cache.set(key, encodeNullIfNeeded(data), CACHE_TTL);
+            }
+            return data;
+        } finally {
+            compareAndDelete(lockKey, token); // 原子校验归属再释放
+        }
+    }
+    boundedBackoff(attempt);
+}
+return fallbackOrReject();
+</code></pre>
+<p>这就是：</p>
+<h3 id="mutex-distributed-lock">Mutex / Distributed Lock</h3>
+<p>互斥锁 / 分布式锁。</p>
+<blockquote>
+<p><strong>工程补充</strong>：锁的创建和 TTL 设置必须原子完成，释放时需原子比较唯一 token，避免删掉别人的锁。租约过期仍可能产生并发执行；缓存重建允许怎样的重复、是否需要版本控制，要按业务确定。涉及严格资源写入时，还要考虑第八章的栅栏令牌。</p>
+</blockquote>
+<hr />
+<h2 id="_15">十五、第三场灾难更加恐怖</h2>
+<p>系统里有：</p>
+<pre><code class="language-text">100万个缓存 Key
+</code></pre>
+<p>林默当初写代码时特别整齐：</p>
+<pre><code class="language-text">TTL = 1小时
+</code></pre>
+<p>上线时间：</p>
+<pre><code class="language-text">20:00
+</code></pre>
+<p>于是大量缓存：</p>
+<pre><code class="language-text">21:00
+</code></pre>
+<p>一起过期。</p>
+<p>Redis 瞬间失去大量数据。</p>
+<p>原本 Redis 每秒挡住：</p>
+<pre><code class="language-text">100000 请求
+</code></pre>
+<p>突然全部转发给 MySQL。</p>
+<p>MySQL 直接挂掉。</p>
+<p>接着：</p>
+<pre><code class="language-text">App 查询 DB 超时
+↓
+线程大量阻塞
+↓
+连接池耗尽
+↓
+App 也挂
+</code></pre>
+<p>整个系统雪崩。</p>
+<p>老周写：</p>
+<h3 id="_16">缓存雪崩</h3>
+<p>Cache Avalanche。</p>
+<p>特点：</p>
+<blockquote>
+<p><strong>大量缓存同时失效。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_17">十六、穿透、击穿、雪崩终于可以不背了</h2>
+<p>林默在白板上画：</p>
+<pre><code class="language-text">穿透：
+
+请求一个不存在的数据
+
+Redis ❌
+DB    ❌
+
+请求一直穿过去
+</code></pre>
+<pre><code class="language-text">击穿：
+
+一个超级热点 Key
+
+Redis Key 刚好过期
+       ↓
+大量请求
+       ↓
+      DB
+</code></pre>
+<pre><code class="language-text">雪崩：
+
+大量 Key 同时过期
+
+Redis 大面积失效
+      ↓
+海量请求
+      ↓
+     DB
+</code></pre>
+<p>所以：</p>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>本质</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>缓存穿透</td>
+<td>查不存在的数据</td>
+</tr>
+<tr>
+<td>缓存击穿</td>
+<td>单个热点 Key 失效</td>
+</tr>
+<tr>
+<td>缓存雪崩</td>
+<td>大量 Key 同时失效</td>
+</tr>
+</tbody>
+</table>
+<p>解决思路也就自然了：</p>
+<pre><code class="language-text">穿透
+→ 缓存空值
+→ Bloom Filter
+
+击穿
+→ 互斥锁
+→ 热点数据不过期/逻辑过期
+
+雪崩
+→ TTL 加随机值
+→ 多级缓存
+→ 限流降级
+</code></pre>
+<hr />
+<h2 id="redis_1">十七、Redis 自己挂了怎么办？</h2>
+<p>林默突然想到一个严重问题。</p>
+<p>现在系统：</p>
+<pre><code class="language-text">                  ┌→ App A ─┐
+用户 → LB ────────┤          │
+                  └→ App B ─┤
+                             ▼
+                           Redis
+                             │
+                             ▼
+                           MySQL
+</code></pre>
+<p>所有人都依赖 Redis。</p>
+<p>如果 Redis 挂了呢？</p>
+<p>老周：</p>
+<p>“恭喜。”</p>
+<p>“什么？”</p>
+<p>“你成功制造了新的单点故障。”</p>
+<p>林默：</p>
+<p>“……”</p>
+<p>上一章他们刚解决：</p>
+<pre><code class="language-text">App 单点
+</code></pre>
+<p>这一章又创造：</p>
+<pre><code class="language-text">Redis 单点
+</code></pre>
+<p>所以系统设计的故事经常就是这样：</p>
+<blockquote>
+<p><strong>解决一个瓶颈，然后发现新的瓶颈。</strong></p>
+</blockquote>
+<p>Redis 也不能只有一台。</p>
+<p>于是下一步就会出现：</p>
+<pre><code class="language-text">Redis 主从复制
+Redis Sentinel
+Redis Cluster
+</code></pre>
+<p>但这还不是最恐怖的。</p>
+<p>因为真正的大 Boss 此时还静静躺在后面：</p>
+<pre><code class="language-text">MySQL
+</code></pre>
+<p>现在虽然 App 有很多台：</p>
+<pre><code class="language-text">App1
+App2
+App3
+App4
+...
+</code></pre>
+<p>Redis 也可以做集群。</p>
+<p>可是所有真正的数据最后还是：</p>
+<pre><code class="language-text">↓
+MySQL
+</code></pre>
+<p>老周指着架构图最下面。</p>
+<p>“林默。”</p>
+<p>“嗯？”</p>
+<p>“如果 MySQL 扛不住怎么办？”</p>
+<p>林默沉默了一会儿。</p>
+<p>然后发现：</p>
+<blockquote>
+<p><strong>他们下一场战争，终于要进入数据库了。</strong></p>
+</blockquote>
+<hr />
+<h2 id="_18">第二章结束</h2>
+<p>现在整个系统已经从：</p>
+<pre><code class="language-text">用户
+ ↓
+App
+ ↓
+MySQL
+</code></pre>
+<p>进化成：</p>
+<pre><code class="language-text">                      ┌→ App A
+用户 → Load Balancer ─┼→ App B
+                      └→ App C
+                           │
+                           ▼
+                         Redis
+                           │
+                           ▼
+                         MySQL
+</code></pre>
+<p>你也已经自然走过：</p>
+<pre><code class="language-text">分布式 Session
+      ↓
+无状态服务
+      ↓
+Redis
+      ↓
+缓存
+      ↓
+Cache Aside
+      ↓
+缓存穿透
+      ↓
+Bloom Filter
+      ↓
+缓存击穿
+      ↓
+分布式锁
+      ↓
+缓存雪崩
+</code></pre>
+<p>真正需要形成的系统设计直觉是：</p>
+<blockquote>
+<p><strong>不要先问“Redis 有哪些用途”。</strong></p>
+</blockquote>
+<p>而要问：</p>
+<blockquote>
+<p><strong>为什么系统发展到这里之后，我们不得不引入 Redis？</strong></p>
+</blockquote>
+<p>下一章就是：</p>
+<h3 id="mysql">下一章：数据库开始冒烟——MySQL 主从复制与读写分离</h3>
+<p>到这一章会进入一个特别重要的系统设计阶段：</p>
+<p><strong>为什么一台 MySQL 不够 → 为什么要主从 → 为什么读写分离 → replication lag 是什么 → 主库挂了怎么办 → 为什么最终还会走向分库分表。</strong></p></article><nav class="chapter-nav" aria-label="章节切换"><a href="chapter-01.html" rel="prev">← 上一章</a><a href="chapter-03.html" rel="next">下一章 →</a></nav></main></div><footer>系统设计：从一台服务器开始<br><small>现有 8 章 · 连载中 · 第九章待续</small><p><a href="editorial.html">整理说明与技术参考</a> · <a href="https://github.com/wupzl/system-design-reader">项目源码 ↗</a></p></footer></body></html>
