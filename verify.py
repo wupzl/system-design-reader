@@ -99,7 +99,7 @@ def main():
                 page.goto(BASE + path.name)
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), (width, path.name, 'overflow')
                 assert page.locator('h1').count() == 1, path.name
-                assert page.locator('.shelf-menu a').count() == 5
+                assert page.locator('.shelf-menu a').count() == 6
                 for image in page.locator('img').all():
                     assert image.evaluate('(img) => img.complete && img.naturalWidth > 0'), (width, path.name)
                 if path.name.startswith('chapter-'):

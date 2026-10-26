@@ -23,7 +23,7 @@ python -m http.server 4175 --directory docs --bind 127.0.0.1
 
 维护 `chapters/01.md` 等正文和 `book.json`，然后运行 `python build.py`。生成的网站文件位于 `docs/`。原稿位于 `source/original.md`，构建不会改写原稿或正文。`scripts/import_source.py` 与 `scripts/create_diagrams.py` 记录首次整理过程，不属于日常构建。
 
-新增章节时，同时更新 `book.json`、首页连载说明、下一章预告及学习书架的章节数。所有页面保留返回书架与五项目切换入口。
+新增章节时，同时更新 `book.json`、首页连载说明、下一章预告及学习书架的章节数。所有页面保留返回书架与六项目切换入口。
 
 ## 验证
 
