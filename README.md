@@ -38,3 +38,6 @@ python verify.py
 ## 发布
 
 GitHub Pages 从 `main` 分支的 `/docs` 发布，线上地址为 https://wupzl.github.io/system-design-reader/ 。
+
+
+项目切换菜单已接入 [Agent 帝国：代码审判者](https://wupzl.github.io/coding-agent-reader/)，九章小说式 Coding Agent 工程阅读。
