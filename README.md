@@ -44,3 +44,6 @@ GitHub Pages 从 `main` 分支的 `/docs` 发布，线上地址为 https://wupzl
 
 
 项目切换菜单已接入 [面试官的审判](https://wupzl.github.io/interview-proof-reader/)，七章技术面试小说与七组本地训练，第八章待续。
+
+
+项目切换菜单已接入 [LangChain 帝国](https://wupzl.github.io/langchain-empire-reader/)，五章正文，第六章待续。
